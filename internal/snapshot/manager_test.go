@@ -35,7 +35,11 @@ func TestManagerRunScanCreatesLatestAndRetention(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolve latest: %v", err)
 		}
-		if resolved != firstDB {
+		firstResolved, err := filepath.EvalSymlinks(firstDB)
+		if err != nil {
+			t.Fatalf("resolve first db: %v", err)
+		}
+		if resolved != firstResolved {
 			t.Fatalf("latest does not point to first db: %s", resolved)
 		}
 	}

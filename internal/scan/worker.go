@@ -10,32 +10,36 @@ import (
 	"time"
 
 	"github.com/michaelscutari/dug/internal/entry"
+	"github.com/michaelscutari/dug/internal/rollup"
 )
 
-// DEBUG: Set to true to print verbose details - REMOVE before production
-const debugVerbose = false // Disabled
+// DEBUG: Use scan options to control verbosity.
 const slowOpThreshold = 200 * time.Millisecond
 
 // Worker processes directories and emits entries.
 type Worker struct {
 	id       int
 	opts     *ScanOptions
+	root     string
 	rootDev  uint64
 	entryCh  chan<- entry.Entry
 	errorCh  chan<- entry.ScanError
+	dirCh    chan<- rollup.DirResult
 	dirQueue chan dirWork
 	inFlight *int64
 	stack    []dirWork
 }
 
 // NewWorker creates a new worker.
-func NewWorker(id int, opts *ScanOptions, rootDev uint64, entryCh chan<- entry.Entry, errorCh chan<- entry.ScanError, dirQueue chan dirWork, inFlight *int64) *Worker {
+func NewWorker(id int, opts *ScanOptions, root string, rootDev uint64, entryCh chan<- entry.Entry, errorCh chan<- entry.ScanError, dirCh chan<- rollup.DirResult, dirQueue chan dirWork, inFlight *int64) *Worker {
 	return &Worker{
 		id:       id,
 		opts:     opts,
+		root:     root,
 		rootDev:  rootDev,
 		entryCh:  entryCh,
 		errorCh:  errorCh,
+		dirCh:    dirCh,
 		dirQueue: dirQueue,
 		inFlight: inFlight,
 	}
@@ -43,11 +47,11 @@ func NewWorker(id int, opts *ScanOptions, rootDev uint64, entryCh chan<- entry.E
 
 // Run processes directory work until the queue is closed.
 func (w *Worker) Run(ctx context.Context) {
-	if debugVerbose {
+	if w.opts.Verbose {
 		fmt.Fprintf(os.Stderr, "[W%d] STARTED inFlight=%d queueLen=%d\n", w.id, atomic.LoadInt64(w.inFlight), len(w.dirQueue))
 	}
 	defer func() {
-		if debugVerbose {
+		if w.opts.Verbose {
 			fmt.Fprintf(os.Stderr, "[W%d] EXITING inFlight=%d queueLen=%d stackLen=%d\n", w.id, atomic.LoadInt64(w.inFlight), len(w.dirQueue), len(w.stack))
 		}
 	}()
@@ -58,38 +62,38 @@ func (w *Worker) Run(ctx context.Context) {
 		inFlight := atomic.LoadInt64(w.inFlight)
 
 		// Periodic status every 1000 loops
-		if debugVerbose && loopCount%1000 == 0 {
+		if w.opts.Verbose && loopCount%1000 == 0 {
 			fmt.Fprintf(os.Stderr, "[W%d] LOOP#%d inFlight=%d queueLen=%d stackLen=%d\n", w.id, loopCount, inFlight, len(w.dirQueue), len(w.stack))
 		}
 
 		if len(w.stack) > 0 {
 			work := w.stack[len(w.stack)-1]
 			w.stack = w.stack[:len(w.stack)-1]
-			if debugVerbose && loopCount%500 == 0 {
+			if w.opts.Verbose && loopCount%500 == 0 {
 				fmt.Fprintf(os.Stderr, "[W%d] POP-STACK depth=%d stackLen=%d path=%s\n", w.id, work.depth, len(w.stack), work.path)
 			}
 			w.processWork(ctx, work)
 			continue
 		}
 
-		if debugVerbose && loopCount%1000 == 0 {
+		if w.opts.Verbose && loopCount%1000 == 0 {
 			fmt.Fprintf(os.Stderr, "[W%d] WAITING-QUEUE inFlight=%d queueLen=%d\n", w.id, inFlight, len(w.dirQueue))
 		}
 
 		select {
 		case <-ctx.Done():
-			if debugVerbose {
+			if w.opts.Verbose {
 				fmt.Fprintf(os.Stderr, "[W%d] CTX-CANCELLED inFlight=%d\n", w.id, atomic.LoadInt64(w.inFlight))
 			}
 			return
 		case work, ok := <-w.dirQueue:
 			if !ok {
-				if debugVerbose {
+				if w.opts.Verbose {
 					fmt.Fprintf(os.Stderr, "[W%d] QUEUE-CLOSED inFlight=%d\n", w.id, atomic.LoadInt64(w.inFlight))
 				}
 				return
 			}
-			if debugVerbose && loopCount%500 == 0 {
+			if w.opts.Verbose && loopCount%500 == 0 {
 				fmt.Fprintf(os.Stderr, "[W%d] DEQUEUE depth=%d queueLen=%d path=%s\n", w.id, work.depth, len(w.dirQueue), work.path)
 			}
 			w.processWork(ctx, work)
@@ -104,19 +108,19 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 	}
 
 	// DEBUG: Log every directory being processed
-	if debugVerbose {
+	if w.opts.Verbose {
 		fmt.Fprintf(os.Stderr, "[W%d] READDIR-START depth=%d path=%s\n", w.id, depth, dirPath)
 	}
 
 	readStart := time.Now()
 	dirEntries, err := os.ReadDir(dirPath)
-	if debugVerbose {
+	if w.opts.Verbose {
 		if took := time.Since(readStart); took > slowOpThreshold {
 			fmt.Fprintf(os.Stderr, "[W%d] READDIR-SLOW depth=%d took=%s path=%s\n", w.id, depth, took, dirPath)
 		}
 	}
 
-	if debugVerbose {
+	if w.opts.Verbose {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[W%d] READDIR-ERR depth=%d err=%v path=%s\n", w.id, depth, err, dirPath)
 		} else {
@@ -133,13 +137,19 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 		}:
 		default:
 		}
+		w.emitDirResult(ctx, dirPath, w.parentOf(dirPath), 0, 0, 0, 0)
 		return
 	}
+
+	var fileSize int64
+	var fileBlocks int64
+	var fileCount int64
+	childDirs := make([]string, 0, 16)
 
 	for i, de := range dirEntries {
 		// Check for cancellation every 100 entries and at start
 		if i%100 == 0 && ctx.Err() != nil {
-			if debugVerbose {
+			if w.opts.Verbose {
 				fmt.Fprintf(os.Stderr, "[W%d] CTX-CANCEL in loop\n", w.id)
 			}
 			return
@@ -154,13 +164,13 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 		// Always use Lstat to avoid following symlinks
 		statStart := time.Now()
 		info, err := os.Lstat(childPath)
-		if debugVerbose {
+		if w.opts.Verbose {
 			if took := time.Since(statStart); took > slowOpThreshold {
 				fmt.Fprintf(os.Stderr, "[W%d] LSTAT-SLOW depth=%d took=%s path=%s\n", w.id, depth, took, childPath)
 			}
 		}
 		if err != nil {
-			if debugVerbose {
+			if w.opts.Verbose {
 				fmt.Fprintf(os.Stderr, "[W%d] LSTAT-ERR path=%s err=%v\n", w.id, childPath, err)
 			}
 			// Non-blocking send - drop error if channel full (errors are sampled anyway)
@@ -208,7 +218,7 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 			return
 		default:
 			// DEBUG: Channel full, log and retry with blocking - REMOVE before production
-			if debugVerbose {
+			if w.opts.Verbose {
 				fmt.Fprintf(os.Stderr, "\n[DEBUG] Entry channel full, blocking on: %s\n", childPath)
 			}
 			select {
@@ -219,11 +229,21 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 		}
 
 		// Queue subdirectories for processing (fallback to local stack if queue is full)
-		if e.Kind == entry.KindDir {
-			w.enqueueOrStack(ctx, childPath, depth+1)
-			if ctx.Err() != nil {
-				return
-			}
+		if e.Kind == entry.KindFile {
+			fileSize += e.Size
+			fileBlocks += e.Blocks
+			fileCount++
+		} else if e.Kind == entry.KindDir {
+			childDirs = append(childDirs, childPath)
+		}
+	}
+
+	w.emitDirResult(ctx, dirPath, w.parentOf(dirPath), fileSize, fileBlocks, fileCount, len(childDirs))
+
+	for i := len(childDirs) - 1; i >= 0; i-- {
+		w.enqueueOrStack(ctx, childDirs[i], depth+1)
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }
@@ -231,7 +251,7 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 func (w *Worker) processWork(ctx context.Context, work dirWork) {
 	w.ProcessDirectory(ctx, work.path, work.depth)
 	newInFlight := atomic.AddInt64(w.inFlight, -1)
-	if debugVerbose && newInFlight <= 5 {
+	if w.opts.Verbose && newInFlight <= 5 {
 		fmt.Fprintf(os.Stderr, "[W%d] DONE-WORK inFlight=%d->%d path=%s\n", w.id, newInFlight+1, newInFlight, work.path)
 	}
 }
@@ -244,15 +264,40 @@ func (w *Worker) enqueueOrStack(ctx context.Context, path string, depth int) {
 	newInFlight := atomic.AddInt64(w.inFlight, 1)
 	select {
 	case w.dirQueue <- dirWork{path: path, depth: depth}:
-		if debugVerbose && newInFlight%1000 == 0 {
+		if w.opts.Verbose && newInFlight%1000 == 0 {
 			fmt.Fprintf(os.Stderr, "[W%d] ENQUEUE inFlight=%d queueLen=%d depth=%d\n", w.id, newInFlight, len(w.dirQueue), depth)
 		}
 		return
 	default:
 		// Queue full: keep work local to avoid deadlock
 		w.stack = append(w.stack, dirWork{path: path, depth: depth})
-		if debugVerbose && len(w.stack)%100 == 1 {
+		if w.opts.Verbose && len(w.stack)%100 == 1 {
 			fmt.Fprintf(os.Stderr, "[W%d] STACK-FULL queueLen=%d stackLen=%d inFlight=%d depth=%d path=%s\n", w.id, len(w.dirQueue), len(w.stack), newInFlight, depth, path)
 		}
 	}
+}
+
+func (w *Worker) emitDirResult(ctx context.Context, path, parent string, size, blocks, files int64, childCount int) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	select {
+	case w.dirCh <- rollup.DirResult{
+		Path:       path,
+		Parent:     parent,
+		FileSize:   size,
+		FileBlocks: blocks,
+		FileCount:  files,
+		ChildCount: childCount,
+	}:
+	case <-ctx.Done():
+	}
+}
+
+func (w *Worker) parentOf(path string) string {
+	if path == w.root {
+		return ""
+	}
+	return filepath.Dir(path)
 }

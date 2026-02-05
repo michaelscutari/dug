@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/michaelscutari/dug/internal/db"
-	"github.com/michaelscutari/dug/internal/rollup"
 	"github.com/michaelscutari/dug/internal/scan"
 
 	_ "modernc.org/sqlite"
@@ -31,6 +30,8 @@ type Manager struct {
 	lockFile     *os.File
 	progressFunc ProgressFunc
 	stageFunc    StageFunc
+	indexMode    string
+	sqliteTmpDir string
 }
 
 // NewManager creates a new snapshot manager.
@@ -49,6 +50,16 @@ func (m *Manager) SetProgressFunc(f ProgressFunc) {
 // SetStageFunc sets a callback for scan stage updates.
 func (m *Manager) SetStageFunc(f StageFunc) {
 	m.stageFunc = f
+}
+
+// SetIndexMode sets the index build mode: memory|disk|skip.
+func (m *Manager) SetIndexMode(mode string) {
+	m.indexMode = mode
+}
+
+// SetSQLiteTmpDir sets the temp directory for SQLite during index build.
+func (m *Manager) SetSQLiteTmpDir(dir string) {
+	m.sqliteTmpDir = dir
 }
 
 // RunScan executes a complete scan workflow.
@@ -119,31 +130,23 @@ func (m *Manager) RunScan(ctx context.Context, root string, opts *scan.ScanOptio
 	}
 
 	// Build indexes
-	if m.stageFunc != nil {
-		m.stageFunc("indexes")
+	if m.indexMode == "" {
+		m.indexMode = "memory"
 	}
-	if err := db.BuildIndexes(database); err != nil {
-		database.Close()
-		os.Remove(tempPath)
-		return "", fmt.Errorf("failed to build indexes: %w", err)
-	}
-
-	// Build rollups
-	builder := rollup.NewBuilder(database)
-	if m.stageFunc != nil {
-		builder.SetProgressFunc(func(done, total int64, depth, maxDepth int) {
-			totalDepths := maxDepth + 1
-			depthDone := maxDepth - depth
-			m.stageFunc(fmt.Sprintf("rollups %d/%d (depth %d/%d)", done, total, depthDone, totalDepths))
-		})
-	}
-	if m.stageFunc != nil {
-		m.stageFunc("rollups")
-	}
-	if err := builder.Build(ctx); err != nil {
-		database.Close()
-		os.Remove(tempPath)
-		return "", fmt.Errorf("failed to build rollups: %w", err)
+	if m.indexMode != "skip" {
+		if m.stageFunc != nil {
+			m.stageFunc("indexes")
+		}
+		if err := db.ApplyIndexPragmas(database, m.indexMode == "disk", m.sqliteTmpDir); err != nil {
+			database.Close()
+			os.Remove(tempPath)
+			return "", fmt.Errorf("failed to apply index pragmas: %w", err)
+		}
+		if err := db.BuildIndexes(database); err != nil {
+			database.Close()
+			os.Remove(tempPath)
+			return "", fmt.Errorf("failed to build indexes: %w", err)
+		}
 	}
 
 	// Finalize

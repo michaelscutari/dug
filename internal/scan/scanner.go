@@ -12,6 +12,7 @@ import (
 
 	"github.com/michaelscutari/dug/internal/db"
 	"github.com/michaelscutari/dug/internal/entry"
+	"github.com/michaelscutari/dug/internal/rollup"
 )
 
 // Scanner coordinates the filesystem scan.
@@ -23,6 +24,8 @@ type Scanner struct {
 
 	entryCh  chan entry.Entry
 	errorCh  chan entry.ScanError
+	dirCh    chan rollup.DirResult
+	rollupCh chan entry.Rollup
 	dirQueue chan dirWork
 
 	inFlight int64
@@ -39,7 +42,7 @@ func NewScanner(opts *ScanOptions) *Scanner {
 		opts = DefaultOptions()
 	}
 	// Much larger queue to avoid inline processing for directories with many subdirs
-	queueSize := opts.Workers * 10000  // 80k with 8 workers
+	queueSize := opts.Workers * 10000 // 80k with 8 workers
 	if queueSize < 50000 {
 		queueSize = 50000
 	}
@@ -48,10 +51,20 @@ func NewScanner(opts *ScanOptions) *Scanner {
 	if entryChSize < 100000 {
 		entryChSize = 100000
 	}
+	dirChSize := opts.Workers * 2048
+	if dirChSize < 8192 {
+		dirChSize = 8192
+	}
+	rollupChSize := opts.BatchSize * 2
+	if rollupChSize < 10000 {
+		rollupChSize = 10000
+	}
 	return &Scanner{
 		opts:     opts,
 		entryCh:  make(chan entry.Entry, entryChSize),
 		errorCh:  make(chan entry.ScanError, 1000),
+		dirCh:    make(chan rollup.DirResult, dirChSize),
+		rollupCh: make(chan entry.Rollup, rollupChSize),
 		dirQueue: make(chan dirWork, queueSize),
 	}
 }
@@ -101,15 +114,22 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 	s.entryCh <- rootEntry
 
 	// Start ingester
-	s.ingester = db.NewIngester(s.database, s.entryCh, s.errorCh, s.opts.BatchSize, s.opts.FlushIntervalMs, s.opts.MaxErrors, cancel)
+	s.ingester = db.NewIngester(s.database, s.entryCh, s.rollupCh, s.errorCh, s.opts.BatchSize, s.opts.FlushIntervalMs, s.opts.MaxErrors, s.opts.Verbose, cancel)
 	ingesterDone := make(chan error, 1)
 	go func() {
 		ingesterDone <- s.ingester.Run(ctx)
 	}()
 
+	// Start rollup aggregator
+	agg := rollup.NewAggregator([]string{root})
+	aggDone := make(chan error, 1)
+	go func() {
+		aggDone <- agg.Run(ctx, s.dirCh, s.rollupCh)
+	}()
+
 	// Start workers
 	for i := 0; i < s.opts.Workers; i++ {
-		worker := NewWorker(i, s.opts, s.rootDev, s.entryCh, s.errorCh, s.dirQueue, &s.inFlight)
+		worker := NewWorker(i, s.opts, s.root, s.rootDev, s.entryCh, s.errorCh, s.dirCh, s.dirQueue, &s.inFlight)
 		s.wg.Add(1)
 		go func(w *Worker) {
 			defer s.wg.Done()
@@ -119,7 +139,9 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 
 	// Seed the queue with root
 	atomic.AddInt64(&s.inFlight, 1)
-	fmt.Fprintf(os.Stderr, "[SCANNER] SEEDED root=%s inFlight=1 queueSize=%d entryChSize=%d\n", root, cap(s.dirQueue), cap(s.entryCh))
+	if s.opts.Verbose {
+		fmt.Fprintf(os.Stderr, "[SCANNER] SEEDED root=%s inFlight=1 queueSize=%d entryChSize=%d\n", root, cap(s.dirQueue), cap(s.entryCh))
+	}
 	select {
 	case s.dirQueue <- dirWork{path: root, depth: 0}:
 	case <-ctx.Done():
@@ -130,18 +152,30 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 	go s.monitorCompletion(ctx)
 
 	// Wait for all in-flight directory processing to finish
-	fmt.Fprintf(os.Stderr, "[SCANNER] WAITING for workers...\n")
+	if s.opts.Verbose {
+		fmt.Fprintf(os.Stderr, "[SCANNER] WAITING for workers...\n")
+	}
 	s.wg.Wait()
-	fmt.Fprintf(os.Stderr, "[SCANNER] ALL-WORKERS-DONE inFlight=%d queueLen=%d entryChLen=%d\n",
-		atomic.LoadInt64(&s.inFlight), len(s.dirQueue), len(s.entryCh))
+	if s.opts.Verbose {
+		fmt.Fprintf(os.Stderr, "[SCANNER] ALL-WORKERS-DONE inFlight=%d queueLen=%d entryChLen=%d\n",
+			atomic.LoadInt64(&s.inFlight), len(s.dirQueue), len(s.entryCh))
+	}
 
 	// Ensure queue is closed after workers exit (safe if already closed)
 	s.closeDirQueue()
 
 	// Close channels to signal completion
-	fmt.Fprintf(os.Stderr, "[SCANNER] CLOSING entryCh and errorCh\n")
+	if s.opts.Verbose {
+		fmt.Fprintf(os.Stderr, "[SCANNER] CLOSING entryCh and errorCh\n")
+	}
 	close(s.entryCh)
 	close(s.errorCh)
+	close(s.dirCh)
+
+	// Wait for rollup aggregation to finish
+	if err := <-aggDone; err != nil {
+		return fmt.Errorf("rollup aggregation failed: %w", err)
+	}
 
 	// Wait for ingester to finish
 	if err := <-ingesterDone; err != nil {
@@ -176,8 +210,10 @@ func (s *Scanner) monitorCompletion(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Fprintf(os.Stderr, "[MONITOR] CTX-CANCELLED inFlight=%d queueLen=%d entryChLen=%d\n",
-				atomic.LoadInt64(&s.inFlight), len(s.dirQueue), len(s.entryCh))
+			if s.opts.Verbose {
+				fmt.Fprintf(os.Stderr, "[MONITOR] CTX-CANCELLED inFlight=%d queueLen=%d entryChLen=%d\n",
+					atomic.LoadInt64(&s.inFlight), len(s.dirQueue), len(s.entryCh))
+			}
 			s.closeDirQueue()
 			return
 		case <-ticker.C:
@@ -187,13 +223,13 @@ func (s *Scanner) monitorCompletion(ctx context.Context) {
 			entryChLen := len(s.entryCh)
 
 			// Log every second (20 ticks at 50ms)
-			if checkCount%20 == 0 {
+			if s.opts.Verbose && checkCount%20 == 0 {
 				fmt.Fprintf(os.Stderr, "[MONITOR] CHECK#%d inFlight=%d queueLen=%d entryChLen=%d\n",
 					checkCount, inFlight, queueLen, entryChLen)
 			}
 
 			// Detect stuck state: inFlight unchanged for multiple checks
-			if inFlight == lastInFlight && inFlight > 0 {
+			if s.opts.Verbose && inFlight == lastInFlight && inFlight > 0 {
 				stuckCount++
 				if stuckCount >= 60 { // 3 seconds stuck
 					fmt.Fprintf(os.Stderr, "[MONITOR] STUCK! inFlight=%d queueLen=%d entryChLen=%d stuckFor=%dms\n",
@@ -205,8 +241,10 @@ func (s *Scanner) monitorCompletion(ctx context.Context) {
 			lastInFlight = inFlight
 
 			if inFlight == 0 {
-				fmt.Fprintf(os.Stderr, "[MONITOR] COMPLETE inFlight=0 queueLen=%d entryChLen=%d - closing queue\n",
-					queueLen, entryChLen)
+				if s.opts.Verbose {
+					fmt.Fprintf(os.Stderr, "[MONITOR] COMPLETE inFlight=0 queueLen=%d entryChLen=%d - closing queue\n",
+						queueLen, entryChLen)
+				}
 				s.closeDirQueue()
 				return
 			}

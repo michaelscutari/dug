@@ -11,10 +11,10 @@ import (
 	"github.com/michaelscutari/dug/internal/entry"
 )
 
-// DEBUG: Set to true to print ingester details - REMOVE before production
-const debugIngester = true // ENABLED for deadlock debugging
+// DEBUG: Controlled by scan verbosity.
 
 const insertEntrySQL = `INSERT OR REPLACE INTO entries (path, name, parent, kind, size, blocks, mtime, depth, dev_id, inode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const insertRollupSQL = `INSERT OR REPLACE INTO rollups (path, total_size, total_blocks, total_files, total_dirs) VALUES (?, ?, ?, ?, ?)`
 const insertErrorSQL = `INSERT INTO scan_errors (path, message) VALUES (?, ?)`
 
 const maxErrorsSampled = 1000
@@ -23,6 +23,7 @@ const maxErrorsSampled = 1000
 type Ingester struct {
 	db              *sql.DB
 	entryCh         <-chan entry.Entry
+	rollupCh        <-chan entry.Rollup
 	errorCh         <-chan entry.ScanError
 	batchSize       int
 	flushIntervalMs int
@@ -30,6 +31,7 @@ type Ingester struct {
 	cancelFunc      context.CancelFunc
 
 	entryBatch  []entry.Entry
+	rollupBatch []entry.Rollup
 	errorBatch  []entry.ScanError
 	errorCount  int64
 	errorCapped bool
@@ -39,8 +41,11 @@ type Ingester struct {
 	dirCount   int64
 	totalBytes int64
 
-	entryStmt *sql.Stmt
-	errorStmt *sql.Stmt
+	entryStmt  *sql.Stmt
+	rollupStmt *sql.Stmt
+	errorStmt  *sql.Stmt
+
+	debug bool
 }
 
 // Progress holds current scan progress.
@@ -52,17 +57,20 @@ type Progress struct {
 }
 
 // NewIngester creates a new ingester.
-func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, errorCh <-chan entry.ScanError, batchSize, flushIntervalMs, maxErrors int, cancelFunc context.CancelFunc) *Ingester {
+func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, rollupCh <-chan entry.Rollup, errorCh <-chan entry.ScanError, batchSize, flushIntervalMs, maxErrors int, debug bool, cancelFunc context.CancelFunc) *Ingester {
 	return &Ingester{
 		db:              db,
 		entryCh:         entryCh,
+		rollupCh:        rollupCh,
 		errorCh:         errorCh,
 		batchSize:       batchSize,
 		flushIntervalMs: flushIntervalMs,
 		maxErrors:       maxErrors,
 		cancelFunc:      cancelFunc,
 		entryBatch:      make([]entry.Entry, 0, batchSize),
+		rollupBatch:     make([]entry.Rollup, 0, batchSize),
 		errorBatch:      make([]entry.ScanError, 0, 100),
+		debug:           debug,
 	}
 }
 
@@ -76,6 +84,12 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	}
 	defer ing.entryStmt.Close()
 
+	ing.rollupStmt, err = ing.db.Prepare(insertRollupSQL)
+	if err != nil {
+		return fmt.Errorf("failed to prepare rollup statement: %w", err)
+	}
+	defer ing.rollupStmt.Close()
+
 	ing.errorStmt, err = ing.db.Prepare(insertErrorSQL)
 	if err != nil {
 		return fmt.Errorf("failed to prepare error statement: %w", err)
@@ -86,31 +100,35 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	loopCount := 0
-	if debugIngester {
+	if ing.debug {
 		fmt.Fprintf(os.Stderr, "[INGESTER] STARTED batchSize=%d flushInterval=%dms\n", ing.batchSize, ing.flushIntervalMs)
 	}
 
-	for {
+	entryCh := ing.entryCh
+	rollupCh := ing.rollupCh
+	errorCh := ing.errorCh
+
+	for entryCh != nil || rollupCh != nil || errorCh != nil {
 		loopCount++
-		if debugIngester && loopCount%10000 == 0 {
+		if ing.debug && loopCount%10000 == 0 {
 			fmt.Fprintf(os.Stderr, "[INGESTER] LOOP#%d batchLen=%d files=%d dirs=%d\n",
 				loopCount, len(ing.entryBatch), atomic.LoadInt64(&ing.fileCount), atomic.LoadInt64(&ing.dirCount))
 		}
 
 		select {
 		case <-ctx.Done():
-			if debugIngester {
+			if ing.debug {
 				fmt.Fprintf(os.Stderr, "[INGESTER] CTX-CANCELLED batchLen=%d\n", len(ing.entryBatch))
 			}
 			return ing.flush()
 
-		case e, ok := <-ing.entryCh:
+		case e, ok := <-entryCh:
 			if !ok {
-				if debugIngester {
-					fmt.Fprintf(os.Stderr, "[INGESTER] ENTRY-CH-CLOSED batchLen=%d - draining errors and flushing\n", len(ing.entryBatch))
+				if ing.debug {
+					fmt.Fprintf(os.Stderr, "[INGESTER] ENTRY-CH-CLOSED batchLen=%d\n", len(ing.entryBatch))
 				}
-				ing.drainErrors()
-				return ing.flush()
+				entryCh = nil
+				continue
 			}
 			// Track progress
 			if e.Kind == entry.KindFile {
@@ -126,29 +144,43 @@ func (ing *Ingester) Run(ctx context.Context) error {
 				}
 			}
 
-		case e, ok := <-ing.errorCh:
-			if ok {
-				ing.errorCount++
-				// Check if max errors exceeded
-				if ing.maxErrors > 0 && ing.errorCount >= int64(ing.maxErrors) {
-					if ing.cancelFunc != nil {
-						ing.cancelFunc() // Signal scan to stop
-					}
+		case r, ok := <-rollupCh:
+			if !ok {
+				rollupCh = nil
+				continue
+			}
+			ing.rollupBatch = append(ing.rollupBatch, r)
+			if len(ing.rollupBatch) >= ing.batchSize {
+				if err := ing.flushRollups(); err != nil {
+					return err
 				}
-				// Only sample first N errors to bound memory
-				if !ing.errorCapped {
-					ing.errorBatch = append(ing.errorBatch, e)
-					if len(ing.errorBatch) >= maxErrorsSampled {
-						ing.errorCapped = true
-						if err := ing.flushErrors(); err != nil {
-							return err
-						}
+			}
+
+		case e, ok := <-errorCh:
+			if !ok {
+				errorCh = nil
+				continue
+			}
+			ing.errorCount++
+			// Check if max errors exceeded
+			if ing.maxErrors > 0 && ing.errorCount >= int64(ing.maxErrors) {
+				if ing.cancelFunc != nil {
+					ing.cancelFunc() // Signal scan to stop
+				}
+			}
+			// Only sample first N errors to bound memory
+			if !ing.errorCapped {
+				ing.errorBatch = append(ing.errorBatch, e)
+				if len(ing.errorBatch) >= maxErrorsSampled {
+					ing.errorCapped = true
+					if err := ing.flushErrors(); err != nil {
+						return err
 					}
 				}
 			}
 
 		case <-ticker.C:
-			if debugIngester && len(ing.entryBatch) > 0 {
+			if ing.debug && len(ing.entryBatch) > 0 {
 				fmt.Fprintf(os.Stderr, "[INGESTER] TICK-FLUSH batchLen=%d\n", len(ing.entryBatch))
 			}
 			if err := ing.flush(); err != nil {
@@ -156,30 +188,18 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			}
 		}
 	}
-}
 
-func (ing *Ingester) drainErrors() {
-	for {
-		select {
-		case e, ok := <-ing.errorCh:
-			if !ok {
-				return
-			}
-			ing.errorCount++
-			if !ing.errorCapped {
-				ing.errorBatch = append(ing.errorBatch, e)
-				if len(ing.errorBatch) >= maxErrorsSampled {
-					ing.errorCapped = true
-				}
-			}
-		default:
-			return
-		}
+	if ing.debug {
+		fmt.Fprintf(os.Stderr, "[INGESTER] INPUTS-CLOSED - flushing remaining batches\n")
 	}
+	return ing.flush()
 }
 
 func (ing *Ingester) flush() error {
 	if err := ing.flushEntries(); err != nil {
+		return err
+	}
+	if err := ing.flushRollups(); err != nil {
 		return err
 	}
 	return ing.flushErrors()
@@ -192,7 +212,7 @@ func (ing *Ingester) flushEntries() error {
 
 	batchLen := len(ing.entryBatch)
 	flushStart := time.Now()
-	if debugIngester {
+	if ing.debug {
 		fmt.Fprintf(os.Stderr, "[INGESTER] FLUSH-START entries=%d files=%d dirs=%d\n",
 			batchLen, atomic.LoadInt64(&ing.fileCount), atomic.LoadInt64(&ing.dirCount))
 	}
@@ -215,11 +235,38 @@ func (ing *Ingester) flushEntries() error {
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	if debugIngester {
+	if ing.debug {
 		fmt.Fprintf(os.Stderr, "[INGESTER] FLUSH-DONE entries=%d took=%v\n", batchLen, time.Since(flushStart))
 	}
 
 	ing.entryBatch = ing.entryBatch[:0]
+	return nil
+}
+
+func (ing *Ingester) flushRollups() error {
+	if len(ing.rollupBatch) == 0 {
+		return nil
+	}
+
+	tx, err := ing.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin rollup transaction: %w", err)
+	}
+
+	stmt := tx.Stmt(ing.rollupStmt)
+	for _, r := range ing.rollupBatch {
+		_, err := stmt.Exec(r.Path, r.TotalSize, r.TotalBlocks, r.TotalFiles, r.TotalDirs)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to insert rollup %q: %w", r.Path, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit rollup transaction: %w", err)
+	}
+
+	ing.rollupBatch = ing.rollupBatch[:0]
 	return nil
 }
 

@@ -8,6 +8,8 @@ import (
 
 	"github.com/michaelscutari/dug/internal/db"
 	"github.com/michaelscutari/dug/internal/entry"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestBuilderRollup(t *testing.T) {

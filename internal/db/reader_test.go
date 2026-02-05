@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/michaelscutari/dug/internal/entry"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestLoadChildrenSortsFilesAndDirsBySize(t *testing.T) {

@@ -36,6 +36,10 @@ var (
 	scanRetention int
 	scanExclude   []string
 	scanMaxErrors int
+	scanVerbose   bool
+	scanProgress  time.Duration
+	scanIndexMode string
+	scanSQLiteTmp string
 )
 
 func init() {
@@ -46,6 +50,10 @@ func init() {
 	scanCmd.Flags().IntVar(&scanRetention, "retention", 5, "Number of snapshots to retain (0 = unlimited)")
 	scanCmd.Flags().StringSliceVarP(&scanExclude, "exclude", "e", nil, "Regex patterns to exclude (can be repeated)")
 	scanCmd.Flags().IntVar(&scanMaxErrors, "max-errors", 0, "Stop after N errors (0 = unlimited)")
+	scanCmd.Flags().BoolVarP(&scanVerbose, "verbose", "v", false, "Enable verbose scan logging")
+	scanCmd.Flags().DurationVar(&scanProgress, "progress-interval", 30*time.Second, "Emit progress lines to stderr at this interval when not a TTY (0 to disable)")
+	scanCmd.Flags().StringVar(&scanIndexMode, "index-mode", "memory", "Index build mode: memory|disk|skip")
+	scanCmd.Flags().StringVar(&scanSQLiteTmp, "sqlite-tmp-dir", "", "Directory for SQLite temp files during index build")
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
@@ -66,7 +74,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 	opts := scan.DefaultOptions().
 		WithWorkers(scanWorkers).
 		WithXdev(scanXdev).
-		WithMaxErrors(scanMaxErrors)
+		WithMaxErrors(scanMaxErrors).
+		WithVerbose(scanVerbose)
 
 	for _, pattern := range scanExclude {
 		if err := opts.AddExcludePattern(pattern); err != nil {
@@ -74,8 +83,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	switch scanIndexMode {
+	case "memory", "disk", "skip":
+	default:
+		return fmt.Errorf("invalid index mode %q (expected memory|disk|skip)", scanIndexMode)
+	}
+
 	// Use snapshot manager
 	mgr := snapshot.NewManager(outDir, scanRetention)
+	mgr.SetIndexMode(scanIndexMode)
+	if scanSQLiteTmp != "" {
+		mgr.SetSQLiteTmpDir(scanSQLiteTmp)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -114,6 +133,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	go func() {
 		ticker := time.NewTicker(80 * time.Millisecond)
 		defer ticker.Stop()
+		lastNonTTY := time.Now()
 		for {
 			select {
 			case <-progressDone:
@@ -148,6 +168,26 @@ func runScan(cmd *cobra.Command, args []string) error {
 						fmt.Fprintf(os.Stderr, "\r\033[K%s Scanning... %d files | %d dirs | %s | %.0f/sec | %s%s",
 							spinner, files, dirs, humanizeBytes(bytes), rate, elapsed, errStr)
 					}
+				} else if scanProgress > 0 && time.Since(lastNonTTY) >= scanProgress {
+					stageVal := stage.Load()
+					stageStr, _ := stageVal.(string)
+					files := atomic.LoadInt64(&lastFiles)
+					dirs := atomic.LoadInt64(&lastDirs)
+					errors := atomic.LoadInt64(&lastErrors)
+					bytes := atomic.LoadInt64(&lastBytes)
+					elapsed := time.Since(startTime).Round(time.Millisecond)
+					rate := float64(0)
+					if elapsed.Seconds() > 0 {
+						rate = float64(files+dirs) / elapsed.Seconds()
+					}
+
+					if stageStr != "" && stageStr != "scan" {
+						fmt.Fprintf(os.Stderr, "PROGRESS stage=%s elapsed=%s\n", stageStr, elapsed)
+					} else {
+						fmt.Fprintf(os.Stderr, "PROGRESS files=%d dirs=%d bytes=%s rate=%.0f/sec elapsed=%s errors=%d\n",
+							files, dirs, humanizeBytes(bytes), rate, elapsed, errors)
+					}
+					lastNonTTY = time.Now()
 				}
 			}
 		}

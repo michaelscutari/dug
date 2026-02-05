@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
 )
 
 const entriesTableDDL = `
@@ -112,6 +113,29 @@ func ApplyReadPragmas(db *sql.DB) error {
 		if _, err := db.Exec(pragma); err != nil {
 			return fmt.Errorf("failed to apply pragma %q: %w", pragma, err)
 		}
+	}
+
+	return nil
+}
+
+// ApplyIndexPragmas configures SQLite for index builds.
+// When diskTemp is true, temp files are stored on disk to reduce RAM usage.
+func ApplyIndexPragmas(db *sql.DB, diskTemp bool, tmpDir string) error {
+	if tmpDir != "" {
+		if err := os.MkdirAll(tmpDir, 0755); err != nil {
+			return fmt.Errorf("failed to create sqlite temp dir: %w", err)
+		}
+		if err := os.Setenv("SQLITE_TMPDIR", tmpDir); err != nil {
+			return fmt.Errorf("failed to set SQLITE_TMPDIR: %w", err)
+		}
+	}
+
+	pragma := "PRAGMA temp_store = MEMORY"
+	if diskTemp {
+		pragma = "PRAGMA temp_store = FILE"
+	}
+	if _, err := db.Exec(pragma); err != nil {
+		return fmt.Errorf("failed to set temp_store: %w", err)
 	}
 
 	return nil

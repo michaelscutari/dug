@@ -22,6 +22,9 @@ type ScanOptions struct {
 
 	// FlushInterval is the maximum time between flushes in milliseconds.
 	FlushIntervalMs int
+
+	// Verbose enables debug logging for scan internals.
+	Verbose bool
 }
 
 // DefaultOptions returns sensible defaults for scanning.
@@ -33,6 +36,7 @@ func DefaultOptions() *ScanOptions {
 		ExcludePatterns: nil,
 		BatchSize:       10000,
 		FlushIntervalMs: 1000,
+		Verbose:         false,
 	}
 	// Exclude NFS snapshot directories by default
 	opts.AddExcludePattern(`/\.snapshot(/|$)`)
@@ -54,6 +58,12 @@ func (o *ScanOptions) WithXdev(xdev bool) *ScanOptions {
 // WithMaxErrors sets the maximum error count.
 func (o *ScanOptions) WithMaxErrors(n int) *ScanOptions {
 	o.MaxErrors = n
+	return o
+}
+
+// WithVerbose enables or disables verbose logging.
+func (o *ScanOptions) WithVerbose(verbose bool) *ScanOptions {
+	o.Verbose = verbose
 	return o
 }
 

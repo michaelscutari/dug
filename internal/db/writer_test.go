@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/michaelscutari/dug/internal/entry"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestIngesterCancelsOnMaxErrors(t *testing.T) {
@@ -24,9 +26,10 @@ func TestIngesterCancelsOnMaxErrors(t *testing.T) {
 	defer cancel()
 
 	entryCh := make(chan entry.Entry, 1)
+	rollupCh := make(chan entry.Rollup, 1)
 	errorCh := make(chan entry.ScanError, 1)
 
-	ing := NewIngester(database, entryCh, errorCh, 10, 10, 1, cancel)
+	ing := NewIngester(database, entryCh, rollupCh, errorCh, 10, 10, 1, false, cancel)
 	done := make(chan error, 1)
 	go func() {
 		done <- ing.Run(ctx)
@@ -34,6 +37,7 @@ func TestIngesterCancelsOnMaxErrors(t *testing.T) {
 
 	errorCh <- entry.ScanError{Path: "/bad", Message: "boom"}
 	close(entryCh)
+	close(rollupCh)
 	close(errorCh)
 
 	select {
