@@ -26,7 +26,7 @@ func init() {
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
-	database, err := sql.Open("sqlite", tuiDB)
+	database, err := sql.Open("sqlite", tuiDB+"?mode=ro")
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}

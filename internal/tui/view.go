@@ -80,8 +80,6 @@ func (m *Model) View() string {
 	diskLabel := headerLabel("DISK", m.sort == SortByDisk, "v")
 	filesLabel := headerLabel("FILES", m.sort == SortByFiles, "v")
 	nameLabel := headerLabel("NAME", m.sort == SortByName, "^")
-	header := fmt.Sprintf("%10s %10s %8s %8s  %s", apparentLabel, diskLabel, filesLabel, "DIRS", nameLabel)
-	writeLine(headerStyle.Render(header))
 
 	// Calculate visible rows
 	footerLines := 2
@@ -95,11 +93,25 @@ func (m *Model) View() string {
 	if m.cursor >= visibleRows {
 		startIdx = m.cursor - visibleRows + 1
 	}
+	endIdx := min(len(m.entries), startIdx+visibleRows)
+
+	widths := calcColumnWidths(m.entries, startIdx, endIdx, apparentLabel, diskLabel, filesLabel, "DIRS")
+	nameWidth := calcNameWidth(m.width, widths)
+
+	nameLabel = truncateRight(nameLabel, nameWidth)
+	header := fmt.Sprintf("%*s %*s %*s %*s  %s",
+		widths.apparent, apparentLabel,
+		widths.disk, diskLabel,
+		widths.files, filesLabel,
+		widths.dirs, "DIRS",
+		nameLabel,
+	)
+	writeLine(headerStyle.Render(header))
 
 	// Entries
-	for i := startIdx; i < len(m.entries) && i < startIdx+visibleRows; i++ {
+	for i := startIdx; i < endIdx; i++ {
 		e := m.entries[i]
-		line := m.formatEntry(e, i == m.cursor)
+		line := m.formatEntry(e, i == m.cursor, widths, nameWidth)
 		b.WriteString(line)
 		b.WriteString("\n")
 	}
@@ -121,7 +133,66 @@ func (m *Model) View() string {
 	return b.String()
 }
 
-func (m *Model) formatEntry(e db.DisplayEntry, selected bool) string {
+type columnWidths struct {
+	apparent int
+	disk     int
+	files    int
+	dirs     int
+}
+
+func calcColumnWidths(entries []db.DisplayEntry, startIdx, endIdx int, apparentLabel, diskLabel, filesLabel, dirsLabel string) columnWidths {
+	w := columnWidths{
+		apparent: len(apparentLabel),
+		disk:     len(diskLabel),
+		files:    len(filesLabel),
+		dirs:     len(dirsLabel),
+	}
+
+	for i := startIdx; i < endIdx; i++ {
+		e := entries[i]
+		apparent := len(FormatSize(e.TotalSize))
+		disk := len(FormatSize(e.TotalBlocks))
+		files := len(FormatCount(e.TotalFiles))
+		dirs := len(FormatCount(e.TotalDirs))
+
+		if apparent > w.apparent {
+			w.apparent = apparent
+		}
+		if disk > w.disk {
+			w.disk = disk
+		}
+		if files > w.files {
+			w.files = files
+		}
+		if dirs > w.dirs {
+			w.dirs = dirs
+		}
+	}
+
+	return w
+}
+
+func calcNameWidth(totalWidth int, w columnWidths) int {
+	// columns + spaces: a + d + f + r + 2 spaces between first 4 + two spaces before name
+	used := w.apparent + w.disk + w.files + w.dirs + 5
+	nameWidth := totalWidth - used
+	if nameWidth < 10 {
+		nameWidth = 10
+	}
+	return nameWidth
+}
+
+func truncateRight(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
+}
+
+func (m *Model) formatEntry(e db.DisplayEntry, selected bool, widths columnWidths, nameWidth int) string {
 	// Format sizes
 	apparent := FormatSize(e.TotalSize)
 	disk := FormatSize(e.TotalBlocks)
@@ -141,7 +212,14 @@ func (m *Model) formatEntry(e db.DisplayEntry, selected bool) string {
 		name = fileStyle.Render(e.Name)
 	}
 
-	line := fmt.Sprintf("%10s %10s %8s %8s  %s", apparent, disk, files, dirs, name)
+	name = truncateRight(name, nameWidth)
+	line := fmt.Sprintf("%*s %*s %*s %*s  %s",
+		widths.apparent, apparent,
+		widths.disk, disk,
+		widths.files, files,
+		widths.dirs, dirs,
+		name,
+	)
 
 	if selected {
 		return selectedStyle.Render(line)

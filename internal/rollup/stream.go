@@ -3,15 +3,14 @@ package rollup
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 
 	"github.com/michaelscutari/dug/internal/entry"
 )
 
 // DirResult summarizes a scanned directory for streaming rollup aggregation.
 type DirResult struct {
-	Path       string
-	Parent     string
+	DirID      int64
+	ParentID   int64
 	FileSize   int64
 	FileBlocks int64
 	FileCount  int64
@@ -20,12 +19,12 @@ type DirResult struct {
 
 // Aggregator computes rollups during scan using directory results.
 type Aggregator struct {
-	roots     map[string]struct{}
-	parents   map[string]string
-	partial   map[string]*entry.Rollup
-	expected  map[string]int
-	completed map[string]int
-	orphans   map[string]*orphanAgg
+	roots     map[int64]struct{}
+	parents   map[int64]int64
+	partial   map[int64]*entry.Rollup
+	expected  map[int64]int
+	completed map[int64]int
+	orphans   map[int64]*orphanAgg
 }
 
 type orphanAgg struct {
@@ -34,18 +33,18 @@ type orphanAgg struct {
 }
 
 // NewAggregator creates a streaming rollup aggregator.
-func NewAggregator(roots []string) *Aggregator {
-	rootSet := make(map[string]struct{}, len(roots))
+func NewAggregator(roots []int64) *Aggregator {
+	rootSet := make(map[int64]struct{}, len(roots))
 	for _, root := range roots {
-		rootSet[filepath.Clean(root)] = struct{}{}
+		rootSet[root] = struct{}{}
 	}
 	return &Aggregator{
 		roots:     rootSet,
-		parents:   make(map[string]string),
-		partial:   make(map[string]*entry.Rollup),
-		expected:  make(map[string]int),
-		completed: make(map[string]int),
-		orphans:   make(map[string]*orphanAgg),
+		parents:   make(map[int64]int64),
+		partial:   make(map[int64]*entry.Rollup),
+		expected:  make(map[int64]int),
+		completed: make(map[int64]int),
+		orphans:   make(map[int64]*orphanAgg),
 	}
 }
 
@@ -72,48 +71,44 @@ func (a *Aggregator) Run(ctx context.Context, in <-chan DirResult, out chan<- en
 }
 
 func (a *Aggregator) handleResult(ctx context.Context, res DirResult, out chan<- entry.Rollup) error {
-	dir := filepath.Clean(res.Path)
-	parent := filepath.Clean(res.Parent)
-	if res.Parent == "" {
-		parent = ""
-	}
-
+	dirID := res.DirID
+	parentID := res.ParentID
 	rollup := &entry.Rollup{
-		Path:        dir,
+		DirID:       dirID,
 		TotalSize:   res.FileSize,
 		TotalBlocks: res.FileBlocks,
 		TotalFiles:  res.FileCount,
 	}
 
-	a.partial[dir] = rollup
-	a.parents[dir] = parent
-	a.expected[dir] = res.ChildCount
+	a.partial[dirID] = rollup
+	a.parents[dirID] = parentID
+	a.expected[dirID] = res.ChildCount
 
-	if orphan, ok := a.orphans[dir]; ok {
+	if orphan, ok := a.orphans[dirID]; ok {
 		rollup.TotalSize += orphan.total.TotalSize
 		rollup.TotalBlocks += orphan.total.TotalBlocks
 		rollup.TotalFiles += orphan.total.TotalFiles
 		rollup.TotalDirs += orphan.total.TotalDirs
-		a.completed[dir] += orphan.count
-		delete(a.orphans, dir)
+		a.completed[dirID] += orphan.count
+		delete(a.orphans, dirID)
 	}
 
-	if a.completed[dir] >= a.expected[dir] {
-		return a.markComplete(ctx, dir, out)
+	if a.completed[dirID] >= a.expected[dirID] {
+		return a.markComplete(ctx, dirID, out)
 	}
 
 	return nil
 }
 
-func (a *Aggregator) markComplete(ctx context.Context, dir string, out chan<- entry.Rollup) error {
+func (a *Aggregator) markComplete(ctx context.Context, dirID int64, out chan<- entry.Rollup) error {
 	for {
-		rollup := a.partial[dir]
-		parent := a.parents[dir]
+		rollup := a.partial[dirID]
+		parentID := a.parents[dirID]
 
-		delete(a.partial, dir)
-		delete(a.expected, dir)
-		delete(a.completed, dir)
-		delete(a.parents, dir)
+		delete(a.partial, dirID)
+		delete(a.expected, dirID)
+		delete(a.completed, dirID)
+		delete(a.parents, dirID)
 
 		select {
 		case out <- *rollup:
@@ -121,21 +116,21 @@ func (a *Aggregator) markComplete(ctx context.Context, dir string, out chan<- en
 			return ctx.Err()
 		}
 
-		if _, isRoot := a.roots[dir]; isRoot || parent == "" {
+		if _, isRoot := a.roots[dirID]; isRoot || parentID == 0 {
 			return nil
 		}
 
-		if parentRollup, ok := a.partial[parent]; ok {
+		if parentRollup, ok := a.partial[parentID]; ok {
 			a.addChildRollup(parentRollup, rollup)
-			a.completed[parent]++
-			if a.completed[parent] < a.expected[parent] {
+			a.completed[parentID]++
+			if a.completed[parentID] < a.expected[parentID] {
 				return nil
 			}
-			dir = parent
+			dirID = parentID
 			continue
 		}
 
-		a.addOrphan(parent, rollup)
+		a.addOrphan(parentID, rollup)
 		return nil
 	}
 }
@@ -147,11 +142,11 @@ func (a *Aggregator) addChildRollup(parent, child *entry.Rollup) {
 	parent.TotalDirs += child.TotalDirs + 1
 }
 
-func (a *Aggregator) addOrphan(parent string, child *entry.Rollup) {
-	agg := a.orphans[parent]
+func (a *Aggregator) addOrphan(parentID int64, child *entry.Rollup) {
+	agg := a.orphans[parentID]
 	if agg == nil {
 		agg = &orphanAgg{}
-		a.orphans[parent] = agg
+		a.orphans[parentID] = agg
 	}
 	agg.total.TotalSize += child.TotalSize
 	agg.total.TotalBlocks += child.TotalBlocks

@@ -23,25 +23,29 @@ type Worker struct {
 	root     string
 	rootDev  uint64
 	entryCh  chan<- entry.Entry
+	dirCh    chan<- entry.Dir
 	errorCh  chan<- entry.ScanError
-	dirCh    chan<- rollup.DirResult
+	dirResCh chan<- rollup.DirResult
 	dirQueue chan dirWork
 	inFlight *int64
 	stack    []dirWork
+	dirIDSeq *int64
 }
 
 // NewWorker creates a new worker.
-func NewWorker(id int, opts *ScanOptions, root string, rootDev uint64, entryCh chan<- entry.Entry, errorCh chan<- entry.ScanError, dirCh chan<- rollup.DirResult, dirQueue chan dirWork, inFlight *int64) *Worker {
+func NewWorker(id int, opts *ScanOptions, root string, rootDev uint64, entryCh chan<- entry.Entry, dirCh chan<- entry.Dir, errorCh chan<- entry.ScanError, dirResCh chan<- rollup.DirResult, dirQueue chan dirWork, inFlight *int64, dirIDSeq *int64) *Worker {
 	return &Worker{
 		id:       id,
 		opts:     opts,
 		root:     root,
 		rootDev:  rootDev,
 		entryCh:  entryCh,
-		errorCh:  errorCh,
 		dirCh:    dirCh,
+		errorCh:  errorCh,
+		dirResCh: dirResCh,
 		dirQueue: dirQueue,
 		inFlight: inFlight,
+		dirIDSeq: dirIDSeq,
 	}
 }
 
@@ -102,10 +106,13 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 // ProcessDirectory reads a directory and emits entries for each child.
-func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int) {
+func (w *Worker) ProcessDirectory(ctx context.Context, work dirWork) {
 	if ctx.Err() != nil {
 		return
 	}
+
+	dirPath := work.path
+	depth := work.depth
 
 	// DEBUG: Log every directory being processed
 	if w.opts.Verbose {
@@ -137,14 +144,14 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 		}:
 		default:
 		}
-		w.emitDirResult(ctx, dirPath, w.parentOf(dirPath), 0, 0, 0, 0)
+		w.emitDirResult(ctx, work.dirID, work.parentID, 0, 0, 0, 0)
 		return
 	}
 
 	var fileSize int64
 	var fileBlocks int64
 	var fileCount int64
-	childDirs := make([]string, 0, 16)
+	childDirs := make([]dirWork, 0, 16)
 
 	for i, de := range dirEntries {
 		// Check for cancellation every 100 entries and at start
@@ -198,50 +205,84 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 			continue
 		}
 
-		e := entry.Entry{
-			Path:    childPath,
-			Name:    de.Name(),
-			Parent:  dirPath,
-			Kind:    entry.KindFromMode(info.Mode()),
-			Size:    info.Size(),
-			Blocks:  blocks,
-			ModTime: info.ModTime(),
-			Depth:   depth + 1,
-			DevID:   devID,
-			Inode:   inode,
-		}
+		kind := entry.KindFromMode(info.Mode())
 
-		// Send entry to channel
-		select {
-		case w.entryCh <- e:
-		case <-ctx.Done():
-			return
-		default:
-			// DEBUG: Channel full, log and retry with blocking - REMOVE before production
-			if w.opts.Verbose {
-				fmt.Fprintf(os.Stderr, "\n[DEBUG] Entry channel full, blocking on: %s\n", childPath)
+		// Queue subdirectories for processing (fallback to local stack if queue is full)
+		if kind == entry.KindFile {
+			fileSize += info.Size()
+			fileBlocks += blocks
+			fileCount++
+			e := entry.Entry{
+				ParentID: work.dirID,
+				Name:     de.Name(),
+				Kind:     kind,
+				Size:     info.Size(),
+				Blocks:   blocks,
+				ModTime:  info.ModTime(),
+				DevID:    devID,
+				Inode:    inode,
 			}
 			select {
 			case w.entryCh <- e:
 			case <-ctx.Done():
 				return
+			default:
+				if w.opts.Verbose {
+					fmt.Fprintf(os.Stderr, "\n[DEBUG] Entry channel full, blocking on: %s\n", childPath)
+				}
+				select {
+				case w.entryCh <- e:
+				case <-ctx.Done():
+					return
+				}
 			}
-		}
-
-		// Queue subdirectories for processing (fallback to local stack if queue is full)
-		if e.Kind == entry.KindFile {
-			fileSize += e.Size
-			fileBlocks += e.Blocks
-			fileCount++
-		} else if e.Kind == entry.KindDir {
-			childDirs = append(childDirs, childPath)
+		} else if kind == entry.KindDir {
+			childID := atomic.AddInt64(w.dirIDSeq, 1)
+			dirEntry := entry.Dir{
+				ID:       childID,
+				Path:     childPath,
+				Name:     de.Name(),
+				ParentID: work.dirID,
+				Depth:    depth + 1,
+			}
+			select {
+			case w.dirCh <- dirEntry:
+			case <-ctx.Done():
+				return
+			}
+			childDirs = append(childDirs, dirWork{path: childPath, dirID: childID, parentID: work.dirID, depth: depth + 1})
+		} else {
+			e := entry.Entry{
+				ParentID: work.dirID,
+				Name:     de.Name(),
+				Kind:     kind,
+				Size:     info.Size(),
+				Blocks:   blocks,
+				ModTime:  info.ModTime(),
+				DevID:    devID,
+				Inode:    inode,
+			}
+			select {
+			case w.entryCh <- e:
+			case <-ctx.Done():
+				return
+			default:
+				if w.opts.Verbose {
+					fmt.Fprintf(os.Stderr, "\n[DEBUG] Entry channel full, blocking on: %s\n", childPath)
+				}
+				select {
+				case w.entryCh <- e:
+				case <-ctx.Done():
+					return
+				}
+			}
 		}
 	}
 
-	w.emitDirResult(ctx, dirPath, w.parentOf(dirPath), fileSize, fileBlocks, fileCount, len(childDirs))
+	w.emitDirResult(ctx, work.dirID, work.parentID, fileSize, fileBlocks, fileCount, len(childDirs))
 
 	for i := len(childDirs) - 1; i >= 0; i-- {
-		w.enqueueOrStack(ctx, childDirs[i], depth+1)
+		w.enqueueOrStack(ctx, childDirs[i])
 		if ctx.Err() != nil {
 			return
 		}
@@ -249,43 +290,43 @@ func (w *Worker) ProcessDirectory(ctx context.Context, dirPath string, depth int
 }
 
 func (w *Worker) processWork(ctx context.Context, work dirWork) {
-	w.ProcessDirectory(ctx, work.path, work.depth)
+	w.ProcessDirectory(ctx, work)
 	newInFlight := atomic.AddInt64(w.inFlight, -1)
 	if w.opts.Verbose && newInFlight <= 5 {
 		fmt.Fprintf(os.Stderr, "[W%d] DONE-WORK inFlight=%d->%d path=%s\n", w.id, newInFlight+1, newInFlight, work.path)
 	}
 }
 
-func (w *Worker) enqueueOrStack(ctx context.Context, path string, depth int) {
+func (w *Worker) enqueueOrStack(ctx context.Context, work dirWork) {
 	if ctx.Err() != nil {
 		return
 	}
 
 	newInFlight := atomic.AddInt64(w.inFlight, 1)
 	select {
-	case w.dirQueue <- dirWork{path: path, depth: depth}:
+	case w.dirQueue <- work:
 		if w.opts.Verbose && newInFlight%1000 == 0 {
-			fmt.Fprintf(os.Stderr, "[W%d] ENQUEUE inFlight=%d queueLen=%d depth=%d\n", w.id, newInFlight, len(w.dirQueue), depth)
+			fmt.Fprintf(os.Stderr, "[W%d] ENQUEUE inFlight=%d queueLen=%d depth=%d\n", w.id, newInFlight, len(w.dirQueue), work.depth)
 		}
 		return
 	default:
 		// Queue full: keep work local to avoid deadlock
-		w.stack = append(w.stack, dirWork{path: path, depth: depth})
+		w.stack = append(w.stack, work)
 		if w.opts.Verbose && len(w.stack)%100 == 1 {
-			fmt.Fprintf(os.Stderr, "[W%d] STACK-FULL queueLen=%d stackLen=%d inFlight=%d depth=%d path=%s\n", w.id, len(w.dirQueue), len(w.stack), newInFlight, depth, path)
+			fmt.Fprintf(os.Stderr, "[W%d] STACK-FULL queueLen=%d stackLen=%d inFlight=%d depth=%d path=%s\n", w.id, len(w.dirQueue), len(w.stack), newInFlight, work.depth, work.path)
 		}
 	}
 }
 
-func (w *Worker) emitDirResult(ctx context.Context, path, parent string, size, blocks, files int64, childCount int) {
+func (w *Worker) emitDirResult(ctx context.Context, dirID, parentID int64, size, blocks, files int64, childCount int) {
 	if ctx.Err() != nil {
 		return
 	}
 
 	select {
-	case w.dirCh <- rollup.DirResult{
-		Path:       path,
-		Parent:     parent,
+	case w.dirResCh <- rollup.DirResult{
+		DirID:      dirID,
+		ParentID:   parentID,
 		FileSize:   size,
 		FileBlocks: blocks,
 		FileCount:  files,
@@ -293,11 +334,4 @@ func (w *Worker) emitDirResult(ctx context.Context, path, parent string, size, b
 	}:
 	case <-ctx.Done():
 	}
-}
-
-func (w *Worker) parentOf(path string) string {
-	if path == w.root {
-		return ""
-	}
-	return filepath.Dir(path)
 }

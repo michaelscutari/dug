@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/michaelscutari/dug/internal/scan"
+	"github.com/michaelscutari/dug/internal/pathutil"
 	"github.com/michaelscutari/dug/internal/snapshot"
 	"github.com/spf13/cobra"
 
@@ -62,6 +63,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("failed to resolve root path: %w", err)
 	}
+	root = pathutil.Normalize(root)
 
 	outDir, err := filepath.Abs(scanOut)
 	if err != nil {

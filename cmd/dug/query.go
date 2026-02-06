@@ -8,6 +8,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/michaelscutari/dug/internal/db"
+	"github.com/michaelscutari/dug/internal/pathutil"
 	"github.com/spf13/cobra"
 
 	_ "modernc.org/sqlite"
@@ -48,6 +49,7 @@ func runQuery(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to get root path: %w", err)
 		}
 	}
+	queryPath = pathutil.Normalize(queryPath)
 
 	entries, err := db.LoadChildren(database, queryPath, querySort, queryLimit)
 	if err != nil {

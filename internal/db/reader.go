@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/michaelscutari/dug/internal/entry"
+	"github.com/michaelscutari/dug/internal/pathutil"
 )
 
 // DisplayEntry combines entry data with rollup data for display.
@@ -24,32 +25,58 @@ type DisplayEntry struct {
 
 // LoadChildren loads child entries for a directory with rollup data.
 func LoadChildren(db *sql.DB, parentPath, sortBy string, limit int) ([]DisplayEntry, error) {
-	orderClause := "COALESCE(r.total_size, e.size) DESC"
+	parentPath = pathutil.Normalize(parentPath)
+	orderClause := "total_size DESC"
 	switch sortBy {
 	case "name":
-		orderClause = "e.name ASC"
+		orderClause = "name ASC"
 	case "files":
-		orderClause = "COALESCE(r.total_files, CASE WHEN e.kind = 0 THEN 1 ELSE 0 END) DESC"
+		orderClause = "total_files DESC"
 	case "size":
-		orderClause = "COALESCE(r.total_size, e.size) DESC"
+		orderClause = "total_size DESC"
 	case "blocks", "disk":
-		orderClause = "COALESCE(r.total_blocks, e.blocks) DESC"
+		orderClause = "total_blocks DESC"
 	}
 
 	query := fmt.Sprintf(`
-		SELECT e.path, e.name, e.kind, e.size, e.blocks, e.mtime,
-		       COALESCE(r.total_size, e.size) as total_size,
-		       COALESCE(r.total_blocks, e.blocks) as total_blocks,
-		       COALESCE(r.total_files, CASE WHEN e.kind = 0 THEN 1 ELSE 0 END) as total_files,
+		SELECT d.path, d.name, ? as kind, 0 as size, 0 as blocks, 0 as mtime,
+		       COALESCE(r.total_size, 0) as total_size,
+		       COALESCE(r.total_blocks, 0) as total_blocks,
+		       COALESCE(r.total_files, 0) as total_files,
 		       COALESCE(r.total_dirs, 0) as total_dirs
+		FROM dirs d
+		LEFT JOIN rollups r ON r.dir_id = d.id
+		WHERE d.parent_id = ?
+
+		UNION ALL
+
+		SELECT (pd.path || '/' || e.name) as path, e.name, e.kind, e.size, e.blocks, e.mtime,
+		       e.size as total_size,
+		       e.blocks as total_blocks,
+		       CASE WHEN e.kind = 0 THEN 1 ELSE 0 END as total_files,
+		       0 as total_dirs
 		FROM entries e
-		LEFT JOIN rollups r ON e.path = r.path
-		WHERE e.parent = ?
+		JOIN dirs pd ON pd.id = e.parent_id
+		WHERE e.parent_id = ?
 		ORDER BY %s
 		LIMIT ?
 	`, orderClause)
 
-	rows, err := db.Query(query, parentPath, limit)
+	var parentID int64
+	cache := getDirCache(db)
+	if cache != nil {
+		if cachedID, ok := cache.Get(parentPath); ok {
+			parentID = cachedID
+		} else if err := db.QueryRow(`SELECT id FROM dirs WHERE path = ?`, parentPath).Scan(&parentID); err != nil {
+			return nil, fmt.Errorf("parent not found: %w", err)
+		} else {
+			cache.Set(parentPath, parentID)
+		}
+	} else if err := db.QueryRow(`SELECT id FROM dirs WHERE path = ?`, parentPath).Scan(&parentID); err != nil {
+		return nil, fmt.Errorf("parent not found: %w", err)
+	}
+
+	rows, err := db.Query(query, entry.KindDir, parentID, parentID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("query failed: %w", err)
 	}
@@ -71,13 +98,33 @@ func LoadChildren(db *sql.DB, parentPath, sortBy string, limit int) ([]DisplayEn
 
 // GetRollup retrieves rollup data for a specific path.
 func GetRollup(db *sql.DB, path string) (*entry.Rollup, error) {
+	path = pathutil.Normalize(path)
 	var r entry.Rollup
-	r.Path = path
+	var dirID int64
+	cache := getDirCache(db)
+	if cache != nil {
+		if cachedID, ok := cache.Get(path); ok {
+			dirID = cachedID
+		} else if err := db.QueryRow(`SELECT id FROM dirs WHERE path = ?`, path).Scan(&dirID); err != nil {
+			if err == sql.ErrNoRows {
+				return nil, nil
+			}
+			return nil, err
+		} else {
+			cache.Set(path, dirID)
+		}
+	} else if err := db.QueryRow(`SELECT id FROM dirs WHERE path = ?`, path).Scan(&dirID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	r.DirID = dirID
 
 	err := db.QueryRow(`
 		SELECT total_size, total_blocks, total_files, total_dirs
-		FROM rollups WHERE path = ?
-	`, path).Scan(&r.TotalSize, &r.TotalBlocks, &r.TotalFiles, &r.TotalDirs)
+		FROM rollups WHERE dir_id = ?
+	`, dirID).Scan(&r.TotalSize, &r.TotalBlocks, &r.TotalFiles, &r.TotalDirs)
 
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -109,25 +156,4 @@ func GetScanMeta(db *sql.DB) (*entry.ScanMeta, error) {
 	}
 
 	return &m, nil
-}
-
-// GetEntry retrieves a single entry by path.
-func GetEntry(db *sql.DB, path string) (*entry.Entry, error) {
-	var e entry.Entry
-	var mtime int64
-
-	err := db.QueryRow(`
-		SELECT path, name, parent, kind, size, blocks, mtime, depth, dev_id, inode
-		FROM entries WHERE path = ?
-	`, path).Scan(&e.Path, &e.Name, &e.Parent, &e.Kind, &e.Size, &e.Blocks, &mtime, &e.Depth, &e.DevID, &e.Inode)
-
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	e.ModTime = time.Unix(mtime, 0)
-	return &e, nil
 }

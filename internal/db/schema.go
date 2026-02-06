@@ -6,16 +6,25 @@ import (
 	"os"
 )
 
+const dirsTableDDL = `
+CREATE TABLE IF NOT EXISTS dirs (
+    id INTEGER PRIMARY KEY,
+    path TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    parent_id INTEGER,
+    depth INTEGER NOT NULL
+);
+`
+
 const entriesTableDDL = `
 CREATE TABLE IF NOT EXISTS entries (
-    path TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER NOT NULL,
     name TEXT NOT NULL,
-    parent TEXT NOT NULL,
     kind INTEGER NOT NULL,
     size INTEGER NOT NULL,
     blocks INTEGER NOT NULL,
     mtime INTEGER NOT NULL,
-    depth INTEGER NOT NULL,
     dev_id INTEGER NOT NULL,
     inode INTEGER NOT NULL
 );
@@ -23,7 +32,7 @@ CREATE TABLE IF NOT EXISTS entries (
 
 const rollupsTableDDL = `
 CREATE TABLE IF NOT EXISTS rollups (
-    path TEXT PRIMARY KEY,
+    dir_id INTEGER PRIMARY KEY,
     total_size INTEGER NOT NULL,
     total_blocks INTEGER NOT NULL,
     total_files INTEGER NOT NULL,
@@ -53,17 +62,18 @@ CREATE TABLE IF NOT EXISTS scan_errors (
 );
 `
 
-const entriesParentIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent);`
-const entriesDepthIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_depth ON entries(depth DESC) WHERE kind = 1;`
-const entriesKindIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_kind ON entries(kind);`
+const dirsPathIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_dirs_path ON dirs(path);`
+const dirsParentIndexDDL = `CREATE INDEX IF NOT EXISTS idx_dirs_parent ON dirs(parent_id);`
+const entriesParentIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent ON entries(parent_id);`
 const rollupsSizeIndexDDL = `CREATE INDEX IF NOT EXISTS idx_rollups_size ON rollups(total_size DESC);`
 const rollupsBlocksIndexDDL = `CREATE INDEX IF NOT EXISTS idx_rollups_blocks ON rollups(total_blocks DESC);`
-const entriesParentSizeIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent_size ON entries(parent, size DESC);`
-const entriesParentBlocksIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent_blocks ON entries(parent, blocks DESC);`
+const entriesParentSizeIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent_size ON entries(parent_id, size DESC);`
+const entriesParentBlocksIndexDDL = `CREATE INDEX IF NOT EXISTS idx_entries_parent_blocks ON entries(parent_id, blocks DESC);`
 
 // InitSchema creates all tables in the database.
 func InitSchema(db *sql.DB) error {
 	ddls := []string{
+		dirsTableDDL,
 		entriesTableDDL,
 		rollupsTableDDL,
 		scanMetaTableDDL,
@@ -101,7 +111,6 @@ func ApplyWritePragmas(db *sql.DB) error {
 // ApplyReadPragmas configures SQLite for optimal read performance.
 func ApplyReadPragmas(db *sql.DB) error {
 	pragmas := []string{
-		"PRAGMA journal_mode = DELETE",
 		"PRAGMA synchronous = NORMAL",
 		"PRAGMA cache_size = -64000",
 		"PRAGMA temp_store = MEMORY",
@@ -113,6 +122,11 @@ func ApplyReadPragmas(db *sql.DB) error {
 		if _, err := db.Exec(pragma); err != nil {
 			return fmt.Errorf("failed to apply pragma %q: %w", pragma, err)
 		}
+	}
+
+	// journal_mode requires write access; best-effort for read-only sessions
+	if _, err := db.Exec("PRAGMA journal_mode = DELETE"); err != nil {
+		return nil
 	}
 
 	return nil
@@ -144,9 +158,9 @@ func ApplyIndexPragmas(db *sql.DB, diskTemp bool, tmpDir string) error {
 // BuildIndexes creates indexes after the initial data load for better performance.
 func BuildIndexes(db *sql.DB) error {
 	indexes := []string{
+		dirsPathIndexDDL,
+		dirsParentIndexDDL,
 		entriesParentIndexDDL,
-		entriesDepthIndexDDL,
-		entriesKindIndexDDL,
 		rollupsSizeIndexDDL,
 		rollupsBlocksIndexDDL,
 		entriesParentSizeIndexDDL,

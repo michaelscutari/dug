@@ -44,16 +44,23 @@ func KindFromMode(mode os.FileMode) Kind {
 
 // Entry represents a filesystem entry to be stored in the database.
 type Entry struct {
-	Path    string
-	Name    string
-	Parent  string
-	Kind    Kind
-	Size    int64  // Apparent size (st_size)
-	Blocks  int64  // Disk usage in bytes (st_blocks * 512)
-	ModTime time.Time
-	Depth   int
-	DevID   uint64
-	Inode   uint64
+	ParentID int64
+	Name     string
+	Kind     Kind
+	Size     int64 // Apparent size (st_size)
+	Blocks   int64 // Disk usage in bytes (st_blocks * 512)
+	ModTime  time.Time
+	DevID    uint64
+	Inode    uint64
+}
+
+// Dir represents a directory entry stored in the database.
+type Dir struct {
+	ID       int64
+	Path     string
+	Name     string
+	ParentID int64
+	Depth    int
 }
 
 // ScanError represents an error encountered during scanning.
@@ -64,7 +71,7 @@ type ScanError struct {
 
 // Rollup represents aggregated statistics for a directory.
 type Rollup struct {
-	Path        string
+	DirID       int64
 	TotalSize   int64 // Apparent size
 	TotalBlocks int64 // Disk usage
 	TotalFiles  int64

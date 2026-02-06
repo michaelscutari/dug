@@ -21,27 +21,37 @@ func TestLoadChildrenSortsFilesAndDirsBySize(t *testing.T) {
 		t.Fatalf("init schema: %v", err)
 	}
 
-	insertEntry := func(path, parent string, kind entry.Kind, size, blocks int64, depth int) {
+	insertDir := func(id int64, path string, parentID int64, depth int) {
 		name := filepath.Base(path)
 		_, err := database.Exec(
-			`INSERT INTO entries (path, name, parent, kind, size, blocks, mtime, depth, dev_id, inode)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			path, name, parent, kind, size, blocks, 0, depth, 0, 0,
+			`INSERT INTO dirs (id, path, name, parent_id, depth) VALUES (?, ?, ?, ?, ?)`,
+			id, path, name, parentID, depth,
 		)
 		if err != nil {
 			t.Fatalf("insert %s: %v", path, err)
 		}
 	}
 
-	insertEntry("/root", "", entry.KindDir, 0, 0, 0)
-	insertEntry("/root/dir1", "/root", entry.KindDir, 0, 0, 1)
-	insertEntry("/root/file1", "/root", entry.KindFile, 200, 512, 1)
-	insertEntry("/root/file2", "/root", entry.KindFile, 50, 512, 1)
+	insertEntry := func(parentID int64, name string, kind entry.Kind, size, blocks int64) {
+		_, err := database.Exec(
+			`INSERT INTO entries (parent_id, name, kind, size, blocks, mtime, dev_id, inode)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			parentID, name, kind, size, blocks, 0, 0, 0,
+		)
+		if err != nil {
+			t.Fatalf("insert %s: %v", name, err)
+		}
+	}
+
+	insertDir(1, "/root", 0, 0)
+	insertDir(2, "/root/dir1", 1, 1)
+	insertEntry(1, "file1", entry.KindFile, 200, 512)
+	insertEntry(1, "file2", entry.KindFile, 50, 512)
 
 	_, err = database.Exec(
-		`INSERT INTO rollups (path, total_size, total_blocks, total_files, total_dirs)
+		`INSERT INTO rollups (dir_id, total_size, total_blocks, total_files, total_dirs)
 		 VALUES (?, ?, ?, ?, ?)`,
-		"/root/dir1", 100, 512, 1, 0,
+		2, 100, 512, 1, 0,
 	)
 	if err != nil {
 		t.Fatalf("insert rollup: %v", err)

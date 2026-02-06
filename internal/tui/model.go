@@ -119,7 +119,7 @@ func (m *Model) helpLine() string {
 	if m.filterActive {
 		return "Type to filter | Enter: apply | Esc: clear | q: quit"
 	}
-	return "↑/↓ navigate | Enter: open | Backspace: back | s/d/n/f: sort | /: filter | q: quit"
+	return "↑/↓ move | Enter: open | Backspace: close | s/d/n/f: sort | /: filter | q: quit"
 }
 
 func (m *Model) setEntries(entries []db.DisplayEntry) {

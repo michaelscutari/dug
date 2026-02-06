@@ -13,8 +13,9 @@ import (
 
 // DEBUG: Controlled by scan verbosity.
 
-const insertEntrySQL = `INSERT OR REPLACE INTO entries (path, name, parent, kind, size, blocks, mtime, depth, dev_id, inode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-const insertRollupSQL = `INSERT OR REPLACE INTO rollups (path, total_size, total_blocks, total_files, total_dirs) VALUES (?, ?, ?, ?, ?)`
+const insertDirSQL = `INSERT OR REPLACE INTO dirs (id, path, name, parent_id, depth) VALUES (?, ?, ?, ?, ?)`
+const insertEntrySQL = `INSERT OR REPLACE INTO entries (parent_id, name, kind, size, blocks, mtime, dev_id, inode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+const insertRollupSQL = `INSERT OR REPLACE INTO rollups (dir_id, total_size, total_blocks, total_files, total_dirs) VALUES (?, ?, ?, ?, ?)`
 const insertErrorSQL = `INSERT INTO scan_errors (path, message) VALUES (?, ?)`
 
 const maxErrorsSampled = 1000
@@ -23,6 +24,7 @@ const maxErrorsSampled = 1000
 type Ingester struct {
 	db              *sql.DB
 	entryCh         <-chan entry.Entry
+	dirCh           <-chan entry.Dir
 	rollupCh        <-chan entry.Rollup
 	errorCh         <-chan entry.ScanError
 	batchSize       int
@@ -31,6 +33,7 @@ type Ingester struct {
 	cancelFunc      context.CancelFunc
 
 	entryBatch  []entry.Entry
+	dirBatch    []entry.Dir
 	rollupBatch []entry.Rollup
 	errorBatch  []entry.ScanError
 	errorCount  int64
@@ -41,6 +44,7 @@ type Ingester struct {
 	dirCount   int64
 	totalBytes int64
 
+	dirStmt    *sql.Stmt
 	entryStmt  *sql.Stmt
 	rollupStmt *sql.Stmt
 	errorStmt  *sql.Stmt
@@ -57,10 +61,11 @@ type Progress struct {
 }
 
 // NewIngester creates a new ingester.
-func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, rollupCh <-chan entry.Rollup, errorCh <-chan entry.ScanError, batchSize, flushIntervalMs, maxErrors int, debug bool, cancelFunc context.CancelFunc) *Ingester {
+func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, dirCh <-chan entry.Dir, rollupCh <-chan entry.Rollup, errorCh <-chan entry.ScanError, batchSize, flushIntervalMs, maxErrors int, debug bool, cancelFunc context.CancelFunc) *Ingester {
 	return &Ingester{
 		db:              db,
 		entryCh:         entryCh,
+		dirCh:           dirCh,
 		rollupCh:        rollupCh,
 		errorCh:         errorCh,
 		batchSize:       batchSize,
@@ -68,6 +73,7 @@ func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, rollupCh <-chan entry.R
 		maxErrors:       maxErrors,
 		cancelFunc:      cancelFunc,
 		entryBatch:      make([]entry.Entry, 0, batchSize),
+		dirBatch:        make([]entry.Dir, 0, batchSize),
 		rollupBatch:     make([]entry.Rollup, 0, batchSize),
 		errorBatch:      make([]entry.ScanError, 0, 100),
 		debug:           debug,
@@ -78,6 +84,12 @@ func NewIngester(db *sql.DB, entryCh <-chan entry.Entry, rollupCh <-chan entry.R
 // It returns when the entry channel is closed.
 func (ing *Ingester) Run(ctx context.Context) error {
 	var err error
+	ing.dirStmt, err = ing.db.Prepare(insertDirSQL)
+	if err != nil {
+		return fmt.Errorf("failed to prepare dir statement: %w", err)
+	}
+	defer ing.dirStmt.Close()
+
 	ing.entryStmt, err = ing.db.Prepare(insertEntrySQL)
 	if err != nil {
 		return fmt.Errorf("failed to prepare entry statement: %w", err)
@@ -105,10 +117,11 @@ func (ing *Ingester) Run(ctx context.Context) error {
 	}
 
 	entryCh := ing.entryCh
+	dirCh := ing.dirCh
 	rollupCh := ing.rollupCh
 	errorCh := ing.errorCh
 
-	for entryCh != nil || rollupCh != nil || errorCh != nil {
+	for entryCh != nil || dirCh != nil || rollupCh != nil || errorCh != nil {
 		loopCount++
 		if ing.debug && loopCount%10000 == 0 {
 			fmt.Fprintf(os.Stderr, "[INGESTER] LOOP#%d batchLen=%d files=%d dirs=%d\n",
@@ -134,12 +147,23 @@ func (ing *Ingester) Run(ctx context.Context) error {
 			if e.Kind == entry.KindFile {
 				atomic.AddInt64(&ing.fileCount, 1)
 				atomic.AddInt64(&ing.totalBytes, e.Blocks)
-			} else if e.Kind == entry.KindDir {
-				atomic.AddInt64(&ing.dirCount, 1)
 			}
 			ing.entryBatch = append(ing.entryBatch, e)
 			if len(ing.entryBatch) >= ing.batchSize {
 				if err := ing.flushEntries(); err != nil {
+					return err
+				}
+			}
+
+		case d, ok := <-dirCh:
+			if !ok {
+				dirCh = nil
+				continue
+			}
+			atomic.AddInt64(&ing.dirCount, 1)
+			ing.dirBatch = append(ing.dirBatch, d)
+			if len(ing.dirBatch) >= ing.batchSize {
+				if err := ing.flushDirs(); err != nil {
 					return err
 				}
 			}
@@ -196,6 +220,9 @@ func (ing *Ingester) Run(ctx context.Context) error {
 }
 
 func (ing *Ingester) flush() error {
+	if err := ing.flushDirs(); err != nil {
+		return err
+	}
 	if err := ing.flushEntries(); err != nil {
 		return err
 	}
@@ -224,10 +251,10 @@ func (ing *Ingester) flushEntries() error {
 
 	stmt := tx.Stmt(ing.entryStmt)
 	for _, e := range ing.entryBatch {
-		_, err := stmt.Exec(e.Path, e.Name, e.Parent, e.Kind, e.Size, e.Blocks, e.ModTime.Unix(), e.Depth, e.DevID, e.Inode)
+		_, err := stmt.Exec(e.ParentID, e.Name, e.Kind, e.Size, e.Blocks, e.ModTime.Unix(), e.DevID, e.Inode)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("failed to insert entry %q: %w", e.Path, err)
+			return fmt.Errorf("failed to insert entry %q: %w", e.Name, err)
 		}
 	}
 
@@ -255,10 +282,10 @@ func (ing *Ingester) flushRollups() error {
 
 	stmt := tx.Stmt(ing.rollupStmt)
 	for _, r := range ing.rollupBatch {
-		_, err := stmt.Exec(r.Path, r.TotalSize, r.TotalBlocks, r.TotalFiles, r.TotalDirs)
+		_, err := stmt.Exec(r.DirID, r.TotalSize, r.TotalBlocks, r.TotalFiles, r.TotalDirs)
 		if err != nil {
 			tx.Rollback()
-			return fmt.Errorf("failed to insert rollup %q: %w", r.Path, err)
+			return fmt.Errorf("failed to insert rollup %d: %w", r.DirID, err)
 		}
 	}
 
@@ -309,5 +336,32 @@ func (ing *Ingester) flushErrors() error {
 	}
 
 	ing.errorBatch = ing.errorBatch[:0]
+	return nil
+}
+
+func (ing *Ingester) flushDirs() error {
+	if len(ing.dirBatch) == 0 {
+		return nil
+	}
+
+	tx, err := ing.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin dir transaction: %w", err)
+	}
+
+	stmt := tx.Stmt(ing.dirStmt)
+	for _, d := range ing.dirBatch {
+		_, err := stmt.Exec(d.ID, d.Path, d.Name, d.ParentID, d.Depth)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to insert dir %q: %w", d.Path, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit dir transaction: %w", err)
+	}
+
+	ing.dirBatch = ing.dirBatch[:0]
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/michaelscutari/dug/internal/db"
 	"github.com/michaelscutari/dug/internal/entry"
+	"github.com/michaelscutari/dug/internal/pathutil"
 	"github.com/michaelscutari/dug/internal/rollup"
 )
 
@@ -22,13 +23,15 @@ type Scanner struct {
 	rootDev  uint64
 	database *sql.DB
 
-	entryCh  chan entry.Entry
-	errorCh  chan entry.ScanError
-	dirCh    chan rollup.DirResult
-	rollupCh chan entry.Rollup
-	dirQueue chan dirWork
+	entryCh     chan entry.Entry
+	dirEntryCh  chan entry.Dir
+	errorCh     chan entry.ScanError
+	dirResultCh chan rollup.DirResult
+	rollupCh    chan entry.Rollup
+	dirQueue    chan dirWork
 
 	inFlight int64
+	dirIDSeq int64
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -51,26 +54,29 @@ func NewScanner(opts *ScanOptions) *Scanner {
 	if entryChSize < 100000 {
 		entryChSize = 100000
 	}
-	dirChSize := opts.Workers * 2048
-	if dirChSize < 8192 {
-		dirChSize = 8192
+	dirEntryChSize := opts.Workers * 2048
+	if dirEntryChSize < 8192 {
+		dirEntryChSize = 8192
 	}
+	dirResultChSize := dirEntryChSize
 	rollupChSize := opts.BatchSize * 2
 	if rollupChSize < 10000 {
 		rollupChSize = 10000
 	}
 	return &Scanner{
-		opts:     opts,
-		entryCh:  make(chan entry.Entry, entryChSize),
-		errorCh:  make(chan entry.ScanError, 1000),
-		dirCh:    make(chan rollup.DirResult, dirChSize),
-		rollupCh: make(chan entry.Rollup, rollupChSize),
-		dirQueue: make(chan dirWork, queueSize),
+		opts:        opts,
+		entryCh:     make(chan entry.Entry, entryChSize),
+		dirEntryCh:  make(chan entry.Dir, dirEntryChSize),
+		errorCh:     make(chan entry.ScanError, 1000),
+		dirResultCh: make(chan rollup.DirResult, dirResultChSize),
+		rollupCh:    make(chan entry.Rollup, rollupChSize),
+		dirQueue:    make(chan dirWork, queueSize),
 	}
 }
 
 // Run executes the scan starting from root and writes to the database.
 func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error {
+	root = pathutil.Normalize(root)
 	s.root = root
 	s.database = database
 
@@ -84,12 +90,8 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 		return fmt.Errorf("failed to stat root: %w", err)
 	}
 
-	var rootInode uint64
-	var rootBlocks int64
 	if stat, ok := rootInfo.Sys().(*syscall.Stat_t); ok {
 		s.rootDev = uint64(stat.Dev)
-		rootInode = stat.Ino
-		rootBlocks = stat.Blocks * 512
 	}
 
 	// Record scan start
@@ -98,38 +100,37 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 		return err
 	}
 
-	// Emit root directory entry
-	rootEntry := entry.Entry{
-		Path:    root,
-		Name:    rootInfo.Name(),
-		Parent:  "",
-		Kind:    entry.KindDir,
-		Size:    rootInfo.Size(),
-		Blocks:  rootBlocks,
-		ModTime: rootInfo.ModTime(),
-		Depth:   0,
-		DevID:   s.rootDev,
-		Inode:   rootInode,
-	}
-	s.entryCh <- rootEntry
-
 	// Start ingester
-	s.ingester = db.NewIngester(s.database, s.entryCh, s.rollupCh, s.errorCh, s.opts.BatchSize, s.opts.FlushIntervalMs, s.opts.MaxErrors, s.opts.Verbose, cancel)
+	s.ingester = db.NewIngester(s.database, s.entryCh, s.dirEntryCh, s.rollupCh, s.errorCh, s.opts.BatchSize, s.opts.FlushIntervalMs, s.opts.MaxErrors, s.opts.Verbose, cancel)
 	ingesterDone := make(chan error, 1)
 	go func() {
 		ingesterDone <- s.ingester.Run(ctx)
 	}()
 
+	rootID := s.nextDirID()
+	rootDir := entry.Dir{
+		ID:       rootID,
+		Path:     root,
+		Name:     rootInfo.Name(),
+		ParentID: 0,
+		Depth:    0,
+	}
+	select {
+	case s.dirEntryCh <- rootDir:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
 	// Start rollup aggregator
-	agg := rollup.NewAggregator([]string{root})
+	agg := rollup.NewAggregator([]int64{rootID})
 	aggDone := make(chan error, 1)
 	go func() {
-		aggDone <- agg.Run(ctx, s.dirCh, s.rollupCh)
+		aggDone <- agg.Run(ctx, s.dirResultCh, s.rollupCh)
 	}()
 
 	// Start workers
 	for i := 0; i < s.opts.Workers; i++ {
-		worker := NewWorker(i, s.opts, s.root, s.rootDev, s.entryCh, s.errorCh, s.dirCh, s.dirQueue, &s.inFlight)
+		worker := NewWorker(i, s.opts, s.root, s.rootDev, s.entryCh, s.dirEntryCh, s.errorCh, s.dirResultCh, s.dirQueue, &s.inFlight, &s.dirIDSeq)
 		s.wg.Add(1)
 		go func(w *Worker) {
 			defer s.wg.Done()
@@ -143,7 +144,7 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 		fmt.Fprintf(os.Stderr, "[SCANNER] SEEDED root=%s inFlight=1 queueSize=%d entryChSize=%d\n", root, cap(s.dirQueue), cap(s.entryCh))
 	}
 	select {
-	case s.dirQueue <- dirWork{path: root, depth: 0}:
+	case s.dirQueue <- dirWork{path: root, dirID: rootID, parentID: 0, depth: 0}:
 	case <-ctx.Done():
 		atomic.AddInt64(&s.inFlight, -1)
 	}
@@ -169,8 +170,9 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 		fmt.Fprintf(os.Stderr, "[SCANNER] CLOSING entryCh and errorCh\n")
 	}
 	close(s.entryCh)
+	close(s.dirEntryCh)
 	close(s.errorCh)
-	close(s.dirCh)
+	close(s.dirResultCh)
 
 	// Wait for rollup aggregation to finish
 	if err := <-aggDone; err != nil {
@@ -196,6 +198,8 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 
 type dirWork struct {
 	path  string
+	dirID int64
+	parentID int64
 	depth int
 }
 
@@ -282,7 +286,7 @@ func (s *Scanner) finalizeScanMeta(errorCount int64) error {
 	row := s.database.QueryRow(`SELECT COUNT(*) FROM entries WHERE kind = 0`)
 	row.Scan(&fileCount)
 
-	row = s.database.QueryRow(`SELECT COUNT(*) FROM entries WHERE kind = 1`)
+	row = s.database.QueryRow(`SELECT COUNT(*) FROM dirs`)
 	row.Scan(&dirCount)
 
 	row = s.database.QueryRow(`SELECT COALESCE(SUM(size), 0) FROM entries WHERE kind = 0`)
@@ -296,4 +300,8 @@ func (s *Scanner) finalizeScanMeta(errorCount int64) error {
 		time.Now().Unix(), totalSize, totalBlocks, fileCount, dirCount, errorCount,
 	)
 	return err
+}
+
+func (s *Scanner) nextDirID() int64 {
+	return atomic.AddInt64(&s.dirIDSeq, 1)
 }

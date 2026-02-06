@@ -7,12 +7,15 @@ import (
 
 var (
 	// Colors
-	colorPrimary   = lipgloss.Color("39")  // Blue
-	colorSecondary = lipgloss.Color("245") // Gray
-	colorHighlight = lipgloss.Color("212") // Pink
-	colorSuccess   = lipgloss.Color("76")  // Green
-	colorWarning   = lipgloss.Color("214") // Orange
-	colorMuted     = lipgloss.Color("240") // Dark gray
+	colorPrimary = lipgloss.AdaptiveColor{Light: "#005B9A", Dark: "#4FA3FF"}
+	colorText     = lipgloss.AdaptiveColor{Light: "#1F1F1F", Dark: "#E6E6E6"}
+	colorSecondary = lipgloss.AdaptiveColor{Light: "#4A4A4A", Dark: "#9A9A9A"}
+	colorHighlight = lipgloss.AdaptiveColor{Light: "#C2185B", Dark: "#FF6FB3"}
+	colorSuccess   = lipgloss.AdaptiveColor{Light: "#0B7A5F", Dark: "#6EE7B7"}
+	colorWarning   = lipgloss.AdaptiveColor{Light: "#B45309", Dark: "#F59E0B"}
+	colorMuted     = lipgloss.AdaptiveColor{Light: "#666666", Dark: "#6F6F6F"}
+	colorSelectBg  = lipgloss.AdaptiveColor{Light: "#DDEBFF", Dark: "#2B4C7E"}
+	colorSelectFg  = lipgloss.AdaptiveColor{Light: "#000000", Dark: "#FFFFFF"}
 
 	// Styles
 	titleStyle = lipgloss.NewStyle().
@@ -36,15 +39,15 @@ var (
 
 	selectedStyle = lipgloss.NewStyle().
 			Bold(true).
-			Foreground(lipgloss.Color("0")).
-			Background(colorPrimary)
+			Foreground(colorSelectFg).
+			Background(colorSelectBg)
 
 	dirStyle = lipgloss.NewStyle().
 			Foreground(colorPrimary).
 			Bold(true)
 
 	fileStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("255"))
+			Foreground(colorText)
 
 	symlinkStyle = lipgloss.NewStyle().
 			Foreground(colorHighlight)
