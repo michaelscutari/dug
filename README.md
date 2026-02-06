@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/michaelscutari/dug/releases"><img src="https://img.shields.io/github/v/release/michaelscutari/dug?style=flat-square&color=blue" alt="Release"></a>
-  <a href="https://github.com/michaelscutari/dug/actions"><img src="https://img.shields.io/github/actions/workflow/status/michaelscutari/dug/release.yml?style=flat-square" alt="Build"></a>
   <a href="https://goreportcard.com/report/github.com/michaelscutari/dug"><img src="https://goreportcard.com/badge/github.com/michaelscutari/dug?style=flat-square" alt="Go Report Card"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
 </p>
