@@ -1,6 +1,18 @@
+# compiled binaries
+/dug
+/dug-*
+/dugdiag*
+/dugsqlitebench*
+/dugstatbench*
+
+# scan data
+data/
+
+# lab-specific
+*.slurm
+mas296@*
+
+# internal
 planning/
 PLAN.md
 .claude/
-/dug
-/dug-*
-data/
