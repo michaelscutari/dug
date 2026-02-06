@@ -197,10 +197,10 @@ func (s *Scanner) Run(ctx context.Context, root string, database *sql.DB) error 
 }
 
 type dirWork struct {
-	path  string
-	dirID int64
+	path     string
+	dirID    int64
 	parentID int64
-	depth int
+	depth    int
 }
 
 func (s *Scanner) monitorCompletion(ctx context.Context) {

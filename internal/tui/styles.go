@@ -7,8 +7,8 @@ import (
 
 var (
 	// Colors
-	colorPrimary = lipgloss.AdaptiveColor{Light: "#005B9A", Dark: "#4FA3FF"}
-	colorText     = lipgloss.AdaptiveColor{Light: "#1F1F1F", Dark: "#E6E6E6"}
+	colorPrimary   = lipgloss.AdaptiveColor{Light: "#005B9A", Dark: "#4FA3FF"}
+	colorText      = lipgloss.AdaptiveColor{Light: "#1F1F1F", Dark: "#E6E6E6"}
 	colorSecondary = lipgloss.AdaptiveColor{Light: "#4A4A4A", Dark: "#9A9A9A"}
 	colorHighlight = lipgloss.AdaptiveColor{Light: "#C2185B", Dark: "#FF6FB3"}
 	colorSuccess   = lipgloss.AdaptiveColor{Light: "#0B7A5F", Dark: "#6EE7B7"}

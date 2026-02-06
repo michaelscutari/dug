@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/michaelscutari/dug/internal/scan"
 	"github.com/michaelscutari/dug/internal/pathutil"
+	"github.com/michaelscutari/dug/internal/scan"
 	"github.com/michaelscutari/dug/internal/snapshot"
 	"github.com/spf13/cobra"
 
