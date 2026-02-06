@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/michaelscutari/dug/internal/db"
@@ -44,14 +45,14 @@ func (m *Model) View() string {
 	writeLine(breadcrumbStyle.Render(pathLabel))
 
 	// Current directory stats
+	dirInfo := ""
 	if m.rollup != nil {
-		dirInfo := fmt.Sprintf("Apparent: %s | Disk: %s | %s files | %s subdirs",
+		dirInfo = fmt.Sprintf("Apparent: %s | Disk: %s | %s files | %s subdirs",
 			FormatSize(m.rollup.TotalSize),
 			FormatSize(m.rollup.TotalBlocks),
 			FormatCount(m.rollup.TotalFiles),
 			FormatCount(m.rollup.TotalDirs),
 		)
-		writeLine(statsStyle.Render(dirInfo))
 	}
 
 	// Status line
@@ -83,6 +84,9 @@ func (m *Model) View() string {
 
 	// Calculate visible rows
 	footerLines := 2
+	if dirInfo != "" {
+		footerLines = 3
+	}
 	visibleRows := m.height - headerLines - footerLines
 	if visibleRows < 5 {
 		visibleRows = 5
@@ -97,14 +101,28 @@ func (m *Model) View() string {
 
 	widths := calcColumnWidths(m.entries, startIdx, endIdx, apparentLabel, diskLabel, filesLabel, "DIRS")
 	nameWidth := calcNameWidth(m.width, widths)
+	gap := strings.Repeat(" ", colGap)
+	nameGap := strings.Repeat(" ", nameGapWidth)
 
+	barLabel := barHeaderLabel(m.sort)
 	nameLabel = truncateRight(nameLabel, nameWidth)
-	header := fmt.Sprintf("%*s %*s %*s %*s  %s",
+	namePad := nameWidth - len(nameLabel)
+	if namePad < 0 {
+		namePad = 0
+	}
+	header := fmt.Sprintf("%*s%s%*s%s%*s%s%*s%s%s%s%s%*s",
 		widths.apparent, apparentLabel,
+		gap,
 		widths.disk, diskLabel,
+		gap,
 		widths.files, filesLabel,
+		gap,
 		widths.dirs, "DIRS",
+		nameGap,
 		nameLabel,
+		strings.Repeat(" ", namePad),
+		gap,
+		barColWidth, barLabel,
 	)
 	writeLine(headerStyle.Render(header))
 
@@ -124,6 +142,10 @@ func (m *Model) View() string {
 
 	// Footer
 	b.WriteString("\n")
+	if dirInfo != "" {
+		b.WriteString(statsStyle.Render(dirInfo))
+		b.WriteString("\n")
+	}
 	help := m.helpLine()
 	if len(m.entries) > 0 {
 		help = fmt.Sprintf("%s [%d/%d]", help, m.cursor+1, len(m.entries))
@@ -139,6 +161,16 @@ type columnWidths struct {
 	files    int
 	dirs     int
 }
+
+const (
+	colGap        = 2
+	nameGapWidth  = 2
+	minNameWidth  = 10
+	barBlockWidth = 10                                        // number of block characters
+	barPctWidth   = 4                                         // " 78%" or "100%"
+	barGapWidth   = 1                                         // space between blocks and pct
+	barColWidth   = barBlockWidth + barGapWidth + barPctWidth // 15
+)
 
 func calcColumnWidths(entries []db.DisplayEntry, startIdx, endIdx int, apparentLabel, diskLabel, filesLabel, dirsLabel string) columnWidths {
 	w := columnWidths{
@@ -173,11 +205,11 @@ func calcColumnWidths(entries []db.DisplayEntry, startIdx, endIdx int, apparentL
 }
 
 func calcNameWidth(totalWidth int, w columnWidths) int {
-	// columns + spaces: a + d + f + r + 2 spaces between first 4 + two spaces before name
-	used := w.apparent + w.disk + w.files + w.dirs + 5
+	// columns + gaps between 4 data cols (3) + gap before name + gap before bar + bar
+	used := w.apparent + w.disk + w.files + w.dirs + (colGap * 4) + nameGapWidth + barColWidth
 	nameWidth := totalWidth - used
-	if nameWidth < 10 {
-		nameWidth = 10
+	if nameWidth < minNameWidth {
+		nameWidth = minNameWidth
 	}
 	return nameWidth
 }
@@ -202,29 +234,107 @@ func (m *Model) formatEntry(e db.DisplayEntry, selected bool, widths columnWidth
 	dirs := FormatCount(e.TotalDirs)
 
 	// Format name with type indicator
-	var name string
+	var rawName string
 	switch e.Kind {
 	case entry.KindDir:
-		name = dirStyle.Render(e.Name + "/")
+		rawName = e.Name + "/"
 	case entry.KindSymlink:
-		name = symlinkStyle.Render(e.Name + "@")
+		rawName = e.Name + "@"
 	default:
-		name = fileStyle.Render(e.Name)
+		rawName = e.Name
 	}
 
-	name = truncateRight(name, nameWidth)
-	line := fmt.Sprintf("%*s %*s %*s %*s  %s",
+	rawName = truncateRight(rawName, nameWidth)
+	var styledName string
+	switch e.Kind {
+	case entry.KindDir:
+		styledName = dirStyle.Render(rawName)
+	case entry.KindSymlink:
+		styledName = symlinkStyle.Render(rawName)
+	default:
+		styledName = fileStyle.Render(rawName)
+	}
+
+	// Pad name to fixed width so bar column aligns
+	pad := nameWidth - len(rawName)
+	if pad < 0 {
+		pad = 0
+	}
+	paddedName := styledName + strings.Repeat(" ", pad)
+
+	// Build bar
+	entryVal, parentTotal := barValues(m.sort, e, m.rollup)
+	bar := formatBar(entryVal, parentTotal)
+
+	gap := strings.Repeat(" ", colGap)
+	nameGap := strings.Repeat(" ", nameGapWidth)
+	line := fmt.Sprintf("%*s%s%*s%s%*s%s%*s%s%s%s%s",
 		widths.apparent, apparent,
+		gap,
 		widths.disk, disk,
+		gap,
 		widths.files, files,
+		gap,
 		widths.dirs, dirs,
-		name,
+		nameGap,
+		paddedName,
+		gap,
+		bar,
 	)
 
 	if selected {
 		return selectedStyle.Render(line)
 	}
 	return line
+}
+
+func barHeaderLabel(sort SortColumn) string {
+	switch sort {
+	case SortByDisk:
+		return "DISK%"
+	case SortByFiles:
+		return "FILE%"
+	default:
+		return "SIZE%"
+	}
+}
+
+func barValues(sort SortColumn, e db.DisplayEntry, rollup *entry.Rollup) (int64, int64) {
+	if rollup == nil {
+		return 0, 0
+	}
+	switch sort {
+	case SortByDisk:
+		return e.TotalBlocks, rollup.TotalBlocks
+	case SortByFiles:
+		return e.TotalFiles, rollup.TotalFiles
+	default:
+		return e.TotalSize, rollup.TotalSize
+	}
+}
+
+func formatBar(entryVal, parentTotal int64) string {
+	if parentTotal <= 0 || entryVal <= 0 {
+		empty := strings.Repeat("░", barBlockWidth)
+		return barEmptyStyle.Render(empty) + fmt.Sprintf("  %3d%%", 0)
+	}
+
+	pct := float64(entryVal) / float64(parentTotal) * 100
+	if pct > 100 {
+		pct = 100
+	}
+
+	filled := int(math.Round(pct / 100 * float64(barBlockWidth)))
+	if filled < 1 && entryVal > 0 {
+		filled = 1
+	}
+	if filled > barBlockWidth {
+		filled = barBlockWidth
+	}
+
+	filledStr := barFilledStyle.Render(strings.Repeat("█", filled))
+	emptyStr := barEmptyStyle.Render(strings.Repeat("░", barBlockWidth-filled))
+	return filledStr + emptyStr + fmt.Sprintf("  %3d%%", int(math.Round(pct)))
 }
 
 func headerLabel(label string, active bool, dir string) string {

@@ -75,6 +75,13 @@ var (
 	statsStyle = lipgloss.NewStyle().
 			Foreground(colorSecondary).
 			MarginBottom(1)
+
+	barFilledStyle = lipgloss.NewStyle().
+			Foreground(colorSuccess).
+			Bold(true)
+
+	barEmptyStyle = lipgloss.NewStyle().
+			Foreground(colorMuted)
 )
 
 // FormatSize formats a byte count for display.
