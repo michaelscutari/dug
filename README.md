@@ -1,6 +1,21 @@
-# dug
+<p align="center">
+  <img src="logo.png" alt="dug" width="200">
+</p>
 
-A filesystem profiler that scans directory trees into SQLite.
+<h1 align="center">dug</h1>
+
+<p align="center">
+  A filesystem profiler that scans directory trees into SQLite.
+</p>
+
+<p align="center">
+  <a href="https://github.com/michaelscutari/dug/releases"><img src="https://img.shields.io/github/v/release/michaelscutari/dug?style=flat-square&color=blue" alt="Release"></a>
+  <a href="https://github.com/michaelscutari/dug/actions"><img src="https://img.shields.io/github/actions/workflow/status/michaelscutari/dug/release.yml?style=flat-square" alt="Build"></a>
+  <a href="https://goreportcard.com/report/github.com/michaelscutari/dug"><img src="https://goreportcard.com/badge/github.com/michaelscutari/dug?style=flat-square" alt="Go Report Card"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+</p>
+
+---
 
 Most disk-usage tools hold the entire file tree in memory. That works until it doesn't — a 50-million-file NFS share will exhaust RAM, crash mid-scan, and lose everything. dug takes a different approach. It streams metadata into a SQLite database as it scans, keeping memory usage constant regardless of filesystem size. The result is a portable `.db` file that anyone can browse, query, or archive — without ever re-scanning.
 
